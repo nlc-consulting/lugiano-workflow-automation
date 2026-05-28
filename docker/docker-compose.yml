@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: lugiano-portal-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: lugiano_dev_pw
+      POSTGRES_DB: lugiano_portal
+    ports:
+      # Host 5433 -> container 5432, to avoid clashing with the native
+      # Postgres that's still running on 5432.
+      - "5433:5432"
+    volumes:
+      - lugiano_portal_pgdata:/var/lib/postgresql/data
+
+volumes:
+  lugiano_portal_pgdata:
