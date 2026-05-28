@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────
+# Secrets & local env  (commit the .example files)
+# ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.local.json
+appsettings.*.local.json
+
+# ─────────────────────────────────────────────
+# .NET  (backend/)
+# ─────────────────────────────────────────────
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+artifacts/
+*.user
+*.suo
+.vs/
+*.userprefs
+
+# ─────────────────────────────────────────────
+# Node  (portal-api/, portal-web/)
+# ─────────────────────────────────────────────
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.eslintcache
+.vite/
+.turbo/
+
+# Prisma generated client (regenerated via `prisma generate`)
+**/generated/prisma/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+# Local run logs created during dev/verification
+api-run.log
+web-run.log
+
+# ─────────────────────────────────────────────
+# Editors / OS
+# ─────────────────────────────────────────────
+.idea/
+*.sln.iml
+*.DotSettings.user
+.DS_Store
+Thumbs.db
