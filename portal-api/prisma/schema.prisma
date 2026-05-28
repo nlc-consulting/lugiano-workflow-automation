@@ -1,10 +1,10 @@
 // Prisma schema for the Lugiano portal API.
-// Datasource: PostgreSQL (native local install).
-// Client output mirrors the biostar convention: src/generated/prisma.
+// Datasource: PostgreSQL (Docker, local).
+// Client uses Prisma's DEFAULT output (node_modules/@prisma/client) so the native
+// query-engine DLL never lands in dist/ — avoids Windows EPERM under nest --watch.
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../src/generated/prisma"
 }
 
 datasource db {
