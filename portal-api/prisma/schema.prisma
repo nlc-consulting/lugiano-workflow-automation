@@ -1,0 +1,34 @@
+// Prisma schema for the Lugiano portal API.
+// Datasource: PostgreSQL (native local install).
+// Client output mirrors the biostar convention: src/generated/prisma.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Ported from biostar, tenancy removed. Role + office for Lugiano.
+model User {
+  id                    Int       @id @default(autoincrement())
+  email                 String    @unique
+  passwordHash          String
+  fullName              String
+  role                  UserRole  @default(BILLER)
+  office                String?
+  isActive              Boolean   @default(true)
+  refreshTokenHash      String?
+  refreshTokenExpiresAt DateTime?
+  createdAt             DateTime  @default(now())
+}
+
+enum UserRole {
+  ADMIN
+  BILLER
+  DOCTOR
+  ATTORNEY
+}
