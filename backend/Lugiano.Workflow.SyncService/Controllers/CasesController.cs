@@ -1,0 +1,196 @@
+using System.Globalization;
+using System.Text.Json;
+using Lugiano.Workflow.SyncService.ChiroTouch;
+using Lugiano.Workflow.SyncService.Services;
+using Lugiano.Workflow.SyncService.Util;
+using Lugiano.Workflow.SyncService.Workflow;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace Lugiano.Workflow.SyncService.Controllers;
+
+[ApiController]
+[Route("cases")]
+public sealed class CasesController : ControllerBase
+{
+    private readonly IDbContextFactory<WorkflowDbContext> _factory;
+    private readonly IPatientDetailQueries _detail;
+    private readonly IChartNoteReadQueries _noteReads;
+    private readonly WorkflowCaseService _cases;
+
+    public CasesController(
+        IDbContextFactory<WorkflowDbContext> factory,
+        IPatientDetailQueries detail,
+        IChartNoteReadQueries noteReads,
+        WorkflowCaseService cases)
+    {
+        _factory = factory;
+        _detail = detail;
+        _noteReads = noteReads;
+        _cases = cases;
+    }
+
+    // GET /cases — dashboard: the portal's workflow record, newest-first, with per-flow stamps.
+    // ra-data-simple-rest: ?range=[start,end] + Content-Range header.
+    [HttpGet]
+    public async Task<IActionResult> GetCases([FromQuery] string? range)
+    {
+        var (skip, take) = ParseRange(range);
+        if (take <= 0 || take > 200) take = 25;
+
+        await using var db = await _factory.CreateDbContextAsync();
+        var total = await db.WorkflowCases.CountAsync();
+
+        var cases = await db.WorkflowCases.AsNoTracking()
+            .OrderByDescending(c => c.UpdatedAt)
+            .Skip(skip).Take(take)
+            .ToListAsync();
+
+        // Derive the displayed state from the flags so it always reflects real
+        // billing-readiness (insurance -> PIP -> notes -> ready).
+        var rows = cases.Select(c =>
+        {
+            var insurance = c.InsuranceAddedAt != null;
+            var notes = c.DoctorNotesReceivedAt != null;
+            var pip = c.PipVerifiedAt != null;
+            return new CaseDto(
+                c.PatientId, c.PatientId, c.FirstName, c.LastName,
+                DeriveState(insurance, notes, pip),
+                insurance, notes, pip,
+                c.InsuranceAddedAt, c.DoctorNotesReceivedAt, c.PipVerifiedAt,
+                c.CreatedAt, c.UpdatedAt);
+        }).ToList();
+
+        var last = total == 0 ? 0 : Math.Min(skip + rows.Count - 1, total - 1);
+        Response.Headers["Content-Range"] = $"cases {skip}-{last}/{total}";
+        return Ok(rows);
+    }
+
+    // GET /cases/{id} — patient detail (live ChiroTouch info + our per-flow stamps). id == PatientId.
+    [HttpGet("{id:int}")]
+    public async Task<IActionResult> GetCase(int id)
+    {
+        if (!_detail.IsConfigured) return NotFound();
+
+        var demo = await _detail.GetDemographicsAsync(id);
+        if (demo is null) return NotFound();
+
+        var policies = await _detail.GetPoliciesAsync(id);
+        var noteRows = await _detail.GetRecentNotesAsync(id, 5);
+
+        var notes = new List<object>();
+        var textBudget = 3;
+        foreach (var n in noteRows)
+        {
+            string? text = null;
+            if (textBudget-- > 0 && n.SoapPtr is int ptr and not 0)
+            {
+                // One bad note's RTF must not 500 the whole detail view.
+                try { text = RtfConverter.ToPlainText(await _noteReads.GetNoteRtfAsync(ptr)); }
+                catch { text = null; }
+            }
+            notes.Add(new { id = n.Id, noteDate = n.NoteDate, doctor = n.Doctor, status = n.Status, plainText = text });
+        }
+
+        await using var db = await _factory.CreateDbContextAsync();
+        var wc = await db.WorkflowCases.AsNoTracking()
+            .Where(c => c.PatientId == id)
+            .Select(c => new
+            {
+                c.CurrentState, c.InsuranceAddedAt, c.DoctorNotesReceivedAt, c.PipVerifiedAt,
+                c.CreatedAt, c.UpdatedAt,
+            })
+            .FirstOrDefaultAsync();
+
+        var insurance = policies.Count > 0;
+        var hasNotes = noteRows.Count > 0;
+        var pip = wc?.PipVerifiedAt != null;
+        var state = wc?.CurrentState ?? DeriveState(insurance, hasNotes, pip);
+
+        return Ok(new
+        {
+            id = demo.PatientId,
+            patientId = demo.PatientId,
+            firstName = demo.FirstName,
+            middleName = demo.MiddleName,
+            lastName = demo.LastName,
+            sex = demo.Sex,
+            address = demo.Address,
+            city = demo.City,
+            state = demo.State,
+            zip = demo.Zip,
+            primaryDoctor = demo.PrimaryDoctor,
+            currentState = state,
+            insuranceProvided = insurance,
+            doctorNotesReceived = hasNotes,
+            pipVerified = pip,
+            insuranceAddedAt = wc?.InsuranceAddedAt,
+            doctorNotesReceivedAt = wc?.DoctorNotesReceivedAt,
+            pipVerifiedAt = wc?.PipVerifiedAt,
+            addedAt = wc?.CreatedAt,
+            lastUpdatedAt = wc?.UpdatedAt,
+            policies = policies.Select(p => new
+            {
+                id = p.Id,
+                insurer = p.Insurer,
+                coverageType = p.CoverageType,
+                effectiveDate = p.EffectiveDate,
+                terminationDate = p.TerminationDate,
+            }),
+            notes,
+        });
+    }
+
+    // POST /cases/{id}/verify-pip?date=YYYY-MM-DD — portal-driven; id == PatientId.
+    // Records/edits the PIP verified date (defaults to today). Not sourced from ChiroTouch.
+    [HttpPost("{id:int}/verify-pip")]
+    public async Task<IActionResult> VerifyPip(int id, [FromQuery] string? date)
+    {
+        var verified = DateTime.UtcNow;
+        if (!string.IsNullOrWhiteSpace(date) &&
+            DateTime.TryParse(date, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var parsed))
+        {
+            verified = parsed;
+        }
+
+        await _cases.SetPipVerifiedAsync(id, verified);
+        return Ok(new { id, patientId = id, pipVerified = true, pipVerifiedAt = verified });
+    }
+
+    private static (int skip, int take) ParseRange(string? range)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(range))
+            {
+                var a = JsonSerializer.Deserialize<int[]>(range);
+                if (a is { Length: 2 }) return (a[0], a[1] - a[0] + 1);
+            }
+        }
+        catch { /* fall through */ }
+        return (0, 25);
+    }
+
+    // Billing-readiness cascade (detail fallback when no case exists yet).
+    private static string DeriveState(bool insurance, bool notes, bool pip) =>
+        !insurance ? WorkflowStates.AwaitingInsurance
+        : !pip ? WorkflowStates.AwaitingPipVerification
+        : !notes ? WorkflowStates.AwaitingDoctorNotes
+        : WorkflowStates.ReadyForAiScrubbing;
+}
+
+// Dashboard row (serialized to camelCase; id == PatientId).
+public record CaseDto(
+    int Id,
+    int PatientId,
+    string? FirstName,
+    string? LastName,
+    string CurrentState,
+    bool InsuranceProvided,
+    bool DoctorNotesReceived,
+    bool PipVerified,
+    DateTime? InsuranceAddedAt,
+    DateTime? DoctorNotesReceivedAt,
+    DateTime? PipVerifiedAt,
+    DateTime AddedAt,
+    DateTime LastUpdatedAt);
