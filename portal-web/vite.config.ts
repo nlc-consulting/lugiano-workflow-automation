@@ -5,9 +5,15 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    // Proxy API calls to the NestJS portal-api (matches biostar convention).
     proxy: {
+      // Portal API (NestJS): auth, users, portal data.
       '/api': 'http://localhost:3000',
+      // Workflow API (.NET): read-only workflow/case data from WorkflowAutomation.
+      '/workflow-api': {
+        target: 'http://localhost:5100',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/workflow-api/, ''),
+      },
     },
   },
 })
