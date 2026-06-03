@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Lugiano.Workflow.SyncService.ChiroTouch;
 using Lugiano.Workflow.SyncService.Services;
 using Lugiano.Workflow.SyncService.Util;
@@ -53,7 +54,7 @@ public sealed class CasesController : ControllerBase
             var pip = c.PipVerifiedAt != null;
             return new CaseDto(
                 c.PatientId, c.PatientId, c.FirstName, c.LastName,
-                WorkflowStates.Derive(insurance, notes, pip),
+                new BillingReadiness(Insurance: insurance, Pip: pip, Notes: notes).DerivedState,
                 insurance, notes, pip,
                 c.InsuranceAddedAt, c.DoctorNotesReceivedAt, c.PipVerifiedAt,
                 c.CreatedAt, c.UpdatedAt);
@@ -75,8 +76,15 @@ public sealed class CasesController : ControllerBase
 
         var policies = await _detail.GetPoliciesAsync(id);
         var noteRows = await _detail.GetRecentNotesAsync(id, 5);
+        // Charges for the visits the recent notes matched into — mirrors how
+        // ChiroTouch shows the bill alongside the notes the reviewer is reading.
+        var matchedVisitIds = noteRows
+            .Where(n => n.VisitId.HasValue)
+            .Select(n => n.VisitId!.Value);
+        var chargeRows = await _detail.GetChargesForVisitsAsync(matchedVisitIds);
 
         var notes = new List<object>();
+        var plainTexts = new List<string>();
         var textBudget = 3;
         foreach (var n in noteRows)
         {
@@ -87,6 +95,7 @@ public sealed class CasesController : ControllerBase
                 try { text = RtfConverter.ToPlainText(await _noteReads.GetNoteRtfAsync(ptr)); }
                 catch { text = null; }
             }
+            if (!string.IsNullOrEmpty(text)) plainTexts.Add(text);
             var (matchScore, matchReasons) = ScoreVisitMatch(n);
 
             notes.Add(new
@@ -107,6 +116,23 @@ public sealed class CasesController : ControllerBase
             });
         }
 
+        // ChiroTouch embeds diagnoses inside the chart-note RTF rather than in a
+        // clean table, so we extract ICD-10 codes from the reconstructed plain
+        // text and look up descriptions from the DiagnosesItems catalog. The
+        // regex requires a period (e.g. M54.12) to avoid false positives like
+        // HCPCS codes (G0283, A4556) that look like ICD on the left side.
+        var distinctCodes = plainTexts
+            .SelectMany(t => IcdPattern.Matches(t).Select(m => m.Value))
+            .Distinct()
+            .ToList();
+        var descMap = distinctCodes.Count > 0
+            ? await _detail.GetDiagnosisDescriptionsAsync(distinctCodes)
+            : new Dictionary<string, string>();
+        var diagnoses = distinctCodes
+            .OrderBy(c => c, StringComparer.Ordinal)
+            .Select(c => new { code = c, description = descMap.GetValueOrDefault(c) })
+            .ToList();
+
         await using var db = await _factory.CreateDbContextAsync();
         var wc = await db.WorkflowCases.AsNoTracking()
             .Where(c => c.PatientId == id)
@@ -122,7 +148,8 @@ public sealed class CasesController : ControllerBase
         var pip = wc?.PipVerifiedAt != null;
         // Always derive from the live ChiroTouch truth so the detail can't drift
         // from a stale stored state.
-        var state = WorkflowStates.Derive(insurance, hasNotes, pip);
+        var state = new BillingReadiness(
+            Insurance: insurance, Pip: pip, Notes: hasNotes).DerivedState;
 
         return Ok(new
         {
@@ -156,6 +183,19 @@ public sealed class CasesController : ControllerBase
                 effectiveDate = p.EffectiveDate,
                 terminationDate = p.TerminationDate,
             }),
+            charges = chargeRows.Select(c => new
+            {
+                id = c.Id,
+                appointmentId = c.AppointmentId,
+                date = c.Date,
+                code = c.Code,
+                description = c.Description,
+                amount = c.Amount,
+                modifier1 = c.Modifier1,
+                modifier2 = c.Modifier2,
+                diagnoses = c.Diagnoses,
+            }),
+            diagnoses,
             notes,
         });
     }
@@ -189,6 +229,13 @@ public sealed class CasesController : ControllerBase
         catch { /* fall through */ }
         return (0, 25);
     }
+
+    // ICD-10 pattern: letter + 2 digits + REQUIRED period + 1-4 alphanumerics
+    // (e.g. M54.12, S43.402A). Requiring the period excludes HCPCS codes like
+    // G0283 and A4556 that share the leading shape but are CPT-side, not Dx.
+    private static readonly Regex IcdPattern = new(
+        @"\b[A-Z]\d{2}\.\d{1,4}[A-Z]?\b",
+        RegexOptions.Compiled);
 
     // Heuristic note->visit match score (0-100). Start at 100, deduct per weakness;
     // tune the weights here as Jacob calibrates against real reviews.
