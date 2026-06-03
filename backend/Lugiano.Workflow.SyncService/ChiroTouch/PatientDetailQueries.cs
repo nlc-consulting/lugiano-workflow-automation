@@ -21,6 +21,20 @@ public sealed record InsurancePolicyRow(
     DateTime? EffectiveDate,
     DateTime? TerminationDate);
 
+public sealed record ChargeRow(
+    int Id,
+    int? AppointmentId,
+    DateTime? Date,
+    string? Code,
+    string? Description,
+    decimal Amount,
+    string? Modifier1,
+    string? Modifier2,
+    // Comma-separated ICD codes billed against this charge, ordered by pointer
+    // sequence. The alignment between this and the matching note's narrative is
+    // the AI scrubber's central check.
+    string? Diagnoses);
+
 public sealed record ChartNoteRow(
     int Id,
     DateTime? NoteDate,
@@ -43,6 +57,8 @@ public interface IPatientDetailQueries
     Task<PatientDemographics?> GetDemographicsAsync(int patientId);
     Task<IReadOnlyList<InsurancePolicyRow>> GetPoliciesAsync(int patientId);
     Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take);
+    Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds);
+    Task<IReadOnlyDictionary<string, string>> GetDiagnosisDescriptionsAsync(IEnumerable<string> codes);
 }
 
 // READ-ONLY patient detail reads from ChiroTouch (lugiano_ro). SELECT only.
@@ -91,6 +107,70 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
             ORDER BY EffectiveDate DESC, ID DESC;
             """;
         return (await conn.QueryAsync<InsurancePolicyRow>(sql, new { patientId })).ToList();
+    }
+
+    public async Task<IReadOnlyDictionary<string, string>> GetDiagnosisDescriptionsAsync(IEnumerable<string> codes)
+    {
+        var codeList = codes.Where(c => !string.IsNullOrWhiteSpace(c)).Distinct().ToList();
+        if (codeList.Count == 0) return new Dictionary<string, string>();
+
+        await using var conn = _sourceDb.Create();
+        // DiagnosesItems has multiple rows per code (the practice has added variants
+        // over time). Lowest ID = original/canonical entry, which matches what
+        // ChiroTouch's UI displays. Small filtered set + window — friendly to PSChiro.
+        const string sql =
+            """
+            WITH ranked AS (
+                SELECT Code, Name,
+                       ROW_NUMBER() OVER (PARTITION BY Code ORDER BY ID) AS rn
+                FROM   dbo.DiagnosesItems
+                WHERE  Code IN @codes
+            )
+            SELECT Code, Name
+            FROM   ranked
+            WHERE  rn = 1;
+            """;
+        var rows = await conn.QueryAsync<CodeDescription>(sql, new { codes = codeList });
+        return rows.ToDictionary(r => r.Code, r => r.Name);
+    }
+
+    private sealed record CodeDescription(string Code, string Name);
+
+    public async Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds)
+    {
+        var ids = appointmentIds.Distinct().ToList();
+        if (ids.Count == 0) return Array.Empty<ChargeRow>();
+
+        await using var conn = _sourceDb.Create();
+        // Service charges only (TranType='C', TranSubType='SV') — Transactions is a
+        // mixed ledger that also holds payments. ChargeDxs.ChargeItemID is actually
+        // Transactions.ID (misleadingly named on the source side). The FOR XML PATH
+        // trick is the SQL Server 2008-compat way to inline-aggregate the per-charge
+        // diagnosis list (PSChiro runs at compat level 100, so STRING_AGG isn't
+        // available even on the 2017 instance).
+        const string sql =
+            """
+            SELECT t.ID          AS Id,
+                   t.ApptID      AS AppointmentId,
+                   t.TranDate    AS Date,
+                   t.Code        AS Code,
+                   t.Description AS Description,
+                   t.TranAmt     AS Amount,
+                   cd.M1         AS Modifier1,
+                   cd.M2         AS Modifier2,
+                   STUFF((SELECT ', ' + dx.DxCode
+                          FROM   dbo.ChargeDxs dx
+                          WHERE  dx.ChargeItemID = t.ID
+                          ORDER BY dx.Seq
+                          FOR XML PATH('')), 1, 2, '') AS Diagnoses
+            FROM   dbo.Transactions t
+            LEFT JOIN dbo.ChargeDetails cd ON cd.ChargeTranID = t.ID
+            WHERE  t.ApptID IN @ids
+              AND  t.TranType    = 'C'
+              AND  t.TranSubType = 'SV'
+            ORDER BY t.TranDate DESC, t.ID;
+            """;
+        return (await conn.QueryAsync<ChargeRow>(sql, new { ids })).ToList();
     }
 
     public async Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take)
