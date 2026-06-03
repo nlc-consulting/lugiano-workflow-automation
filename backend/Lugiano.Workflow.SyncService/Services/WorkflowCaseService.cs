@@ -10,12 +10,16 @@ public sealed class WorkflowCaseService
 
     public WorkflowCaseService(IDbContextFactory<WorkflowDbContext> dbFactory) => _dbFactory = dbFactory;
 
-    // Creates the case for a patient if absent, otherwise advances its state.
-    // Optionally stamps a flow's "first recorded" date (only set once, preserving first-seen).
+    // Creates or RECONCILES a patient's case from the full ChiroTouch truth.
+    // Every trigger passes the reconciled status (insurance + notes + real dates),
+    // so a note trigger also captures insurance present since intake and vice versa.
+    // Stamps reflect current reality (set, not first-seen); state is always derived.
+    // PIP is portal-driven and preserved across reconciliation.
     // Returns the WorkflowCase.Id. One case per patient (unique index on PatientId).
     public async Task<int> CreateOrUpdateCaseAsync(
-        int patientId, string? firstName, string? lastName, string newState,
-        DateTime? insuranceAddedAt = null, DateTime? doctorNotesReceivedAt = null)
+        int patientId, string? firstName, string? lastName,
+        bool hasInsurance, DateTime? insuranceAddedAt,
+        bool hasNotes, DateTime? doctorNotesReceivedAt)
     {
         await using var db = await _dbFactory.CreateDbContextAsync();
         var now = DateTime.UtcNow;
@@ -28,23 +32,27 @@ public sealed class WorkflowCaseService
                 PatientId = patientId,
                 FirstName = firstName,
                 LastName = lastName,
-                CurrentState = newState,
+                CurrentState = new BillingReadiness(
+                    Insurance: hasInsurance, Pip: false, Notes: hasNotes).DerivedState,
                 CreatedAt = now,
                 UpdatedAt = now,
-                InsuranceAddedAt = insuranceAddedAt,
-                DoctorNotesReceivedAt = doctorNotesReceivedAt,
+                InsuranceAddedAt = hasInsurance ? insuranceAddedAt : null,
+                DoctorNotesReceivedAt = hasNotes ? doctorNotesReceivedAt : null,
             };
             db.WorkflowCases.Add(created);
             await db.SaveChangesAsync();
             return created.Id;
         }
 
-        existing.CurrentState = newState;
         existing.FirstName = firstName ?? existing.FirstName;
         existing.LastName = lastName ?? existing.LastName;
-        // Stamp each flow only the first time we see it.
-        existing.InsuranceAddedAt ??= insuranceAddedAt;
-        existing.DoctorNotesReceivedAt ??= doctorNotesReceivedAt;
+        // Reflect current ChiroTouch truth (don't preserve a stale "missing" flag).
+        existing.InsuranceAddedAt = hasInsurance ? insuranceAddedAt : null;
+        existing.DoctorNotesReceivedAt = hasNotes ? doctorNotesReceivedAt : null;
+        existing.CurrentState = new BillingReadiness(
+            Insurance: hasInsurance,
+            Pip: existing.PipVerifiedAt != null,
+            Notes: hasNotes).DerivedState;
         existing.UpdatedAt = now;
         await db.SaveChangesAsync();
         return existing.Id;
@@ -63,7 +71,9 @@ public sealed class WorkflowCaseService
             existing = new WorkflowCase
             {
                 PatientId = patientId,
-                CurrentState = WorkflowStates.AwaitingDoctorNotes,
+                // No reconciled case yet: insurance/notes unknown until the next poll.
+                CurrentState = new BillingReadiness(
+                    Insurance: false, Pip: true, Notes: false).DerivedState,
                 CreatedAt = now,
                 UpdatedAt = now,
                 PipVerifiedAt = verifiedDate,
@@ -74,8 +84,10 @@ public sealed class WorkflowCaseService
         }
 
         existing.PipVerifiedAt = verifiedDate;
-        if (existing.CurrentState == WorkflowStates.AwaitingPipVerification)
-            existing.CurrentState = WorkflowStates.AwaitingDoctorNotes;
+        existing.CurrentState = new BillingReadiness(
+            Insurance: existing.InsuranceAddedAt != null,
+            Pip: true,
+            Notes: existing.DoctorNotesReceivedAt != null).DerivedState;
         existing.UpdatedAt = now;
         await db.SaveChangesAsync();
         return existing.Id;
