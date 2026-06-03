@@ -9,13 +9,14 @@ import UserList from './users/UserList'
 import CaseList from './cases/CaseList'
 import CaseShow from './cases/CaseShow'
 
-// Biostar brand color carried over.
+const LUGIANO_RED = '#E11D2A'
+
 const theme = createTheme({
   ...defaultTheme,
   palette: {
     ...defaultTheme.palette,
-    primary: { ...defaultTheme.palette?.primary, main: '#204487' },
-    secondary: { ...defaultTheme.palette?.secondary, main: '#204487' },
+    primary: { ...defaultTheme.palette?.primary, main: LUGIANO_RED },
+    secondary: { ...defaultTheme.palette?.secondary, main: LUGIANO_RED },
   },
 })
 
