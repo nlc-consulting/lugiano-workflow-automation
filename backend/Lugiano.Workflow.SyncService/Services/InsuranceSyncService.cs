@@ -10,17 +10,20 @@ namespace Lugiano.Workflow.SyncService.Services;
 public sealed class InsuranceSyncService
 {
     private readonly IInsuranceReadQueries _reads;
+    private readonly IPatientStatusQueries _status;
     private readonly WorkflowCaseService _cases;
     private readonly SyncStateService _syncState;
     private readonly ILogger<InsuranceSyncService> _logger;
 
     public InsuranceSyncService(
         IInsuranceReadQueries reads,
+        IPatientStatusQueries status,
         WorkflowCaseService cases,
         SyncStateService syncState,
         ILogger<InsuranceSyncService> logger)
     {
         _reads = reads;
+        _status = status;
         _cases = cases;
         _syncState = syncState;
         _logger = logger;
@@ -52,10 +55,15 @@ public sealed class InsuranceSyncService
             ct.ThrowIfCancellationRequested();
             try
             {
+                // Reconcile the WHOLE patient, not just this policy: pull current
+                // insurance + notes truth (real dates) so the case reflects reality.
+                var status = await _status.GetStatusAsync(policy.PatientId);
                 int caseId = await _cases.CreateOrUpdateCaseAsync(
                     policy.PatientId, patient.FirstName, patient.LastName,
-                    WorkflowStates.AwaitingPipVerification,
-                    insuranceAddedAt: DateTime.UtcNow);
+                    hasInsurance: status.HasInsurance,
+                    insuranceAddedAt: status.InsuranceEffectiveDate,
+                    hasNotes: status.HasNotes,
+                    doctorNotesReceivedAt: status.LatestNoteDate);
                 casesTouched++;
 
                 if (!await _cases.WorkflowEventExistsAsync(SourceTables.InsPolicies, policy.Id))
@@ -72,8 +80,8 @@ public sealed class InsuranceSyncService
                     });
                     eventsCreated++;
                     _logger.LogInformation(
-                        "Insurance: case {CaseId} (patient {PatientId}) -> {State}, event InsuranceAdded (policy {PolicyId}, {InsCo}).",
-                        caseId, policy.PatientId, WorkflowStates.AwaitingPipVerification, policy.Id, policy.InsCoName);
+                        "Insurance: case {CaseId} (patient {PatientId}) reconciled, event InsuranceAdded (policy {PolicyId}, {InsCo}).",
+                        caseId, policy.PatientId, policy.Id, policy.InsCoName);
                 }
 
                 // Advance the cursor only after this record fully succeeds.
