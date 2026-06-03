@@ -6,14 +6,19 @@ public static class WorkflowStates
     public const string AwaitingPipVerification = "AwaitingPipVerification";
     public const string AwaitingDoctorNotes = "AwaitingDoctorNotes";
     public const string ReadyForAiScrubbing = "ReadyForAiScrubbing";
+}
 
-    // Billing-readiness cascade: insurance -> PIP verified -> doctor notes -> ready.
-    // Single source of truth used by the worker (stored state) and the API (display).
-    public static string Derive(bool insurance, bool notes, bool pip) =>
-        !insurance ? AwaitingInsurance
-        : !pip ? AwaitingPipVerification
-        : !notes ? AwaitingDoctorNotes
-        : ReadyForAiScrubbing;
+// Snapshot of a patient's billing-readiness flags. Owns the cascade so adding a
+// new gate (signature, charges, scrub-passed, etc.) is a property + one branch
+// here rather than a signature change at every call site. Always construct with
+// named args so the boolean parameters stay readable.
+public readonly record struct BillingReadiness(bool Insurance, bool Pip, bool Notes)
+{
+    public string DerivedState =>
+        !Insurance ? WorkflowStates.AwaitingInsurance
+        : !Pip     ? WorkflowStates.AwaitingPipVerification
+        : !Notes   ? WorkflowStates.AwaitingDoctorNotes
+        : WorkflowStates.ReadyForAiScrubbing;
 }
 
 public static class EventTypes
