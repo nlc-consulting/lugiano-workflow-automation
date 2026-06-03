@@ -26,7 +26,16 @@ public sealed record ChartNoteRow(
     DateTime? NoteDate,
     string? Doctor,
     int? Status,
-    int? SoapPtr);
+    int? SoapPtr,
+    // Visit linkage: ChartNotes has no AppointmentID, so we match by
+    // (PatientID, same calendar date). VisitsSameDay surfaces ambiguity
+    // (>1 = uncertain match, 0 = no matching appointment found).
+    int? VisitId,
+    DateTime? VisitTime,
+    DateTime? VisitCheckIn,
+    DateTime? VisitCheckOut,
+    string? VisitDoctor,
+    int VisitsSameDay);
 
 public interface IPatientDetailQueries
 {
@@ -87,6 +96,11 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
     public async Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take)
     {
         await using var conn = _sourceDb.Create();
+        // Notes are joined to their visit by (PatientID, same calendar date).
+        // OUTER APPLY picks the most likely match when more than one appointment
+        // sits on the same day (preferring checked-out > checked-in > closest
+        // scheduled time). VisitsSameDay reports the candidate count so the UI
+        // can flag ambiguous (>1) or missing (=0) matches.
         const string sql =
             """
             SELECT TOP (@take)
@@ -94,9 +108,33 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
                    cn.NoteDate AS NoteDate,
                    d.FullName  AS Doctor,
                    cn.Status   AS Status,
-                   cn.SOAPPtr  AS SoapPtr
+                   cn.SOAPPtr  AS SoapPtr,
+                   v.AppointmentID    AS VisitId,
+                   v.ScheduleDateTime AS VisitTime,
+                   v.CheckInDateTime  AS VisitCheckIn,
+                   v.CheckOutDateTime AS VisitCheckOut,
+                   v.VisitDoctor      AS VisitDoctor,
+                   (SELECT COUNT(*) FROM dbo.Appointments a2
+                      WHERE a2.PatientID = cn.PatientID
+                        AND CAST(a2.ScheduleDateTime AS date) = CAST(cn.NoteDate AS date)) AS VisitsSameDay
             FROM   dbo.ChartNotes cn
             LEFT JOIN dbo.Doctors d ON d.ID = cn.DoctorID
+            OUTER APPLY (
+                SELECT TOP 1
+                       a.ID                AS AppointmentID,
+                       a.ScheduleDateTime,
+                       a.CheckInDateTime,
+                       a.CheckOutDateTime,
+                       ad.FullName         AS VisitDoctor
+                FROM   dbo.Appointments a
+                LEFT JOIN dbo.Doctors ad ON ad.ID = a.DoctorID
+                WHERE  a.PatientID = cn.PatientID
+                  AND  CAST(a.ScheduleDateTime AS date) = CAST(cn.NoteDate AS date)
+                ORDER BY
+                    CASE WHEN a.CheckOutDateTime IS NOT NULL THEN 0 ELSE 1 END,
+                    CASE WHEN a.CheckInDateTime  IS NOT NULL THEN 0 ELSE 1 END,
+                    ABS(DATEDIFF(MINUTE, a.ScheduleDateTime, cn.NoteDate))
+            ) v
             WHERE  cn.PatientID = @patientId
             ORDER BY cn.NoteDate DESC, cn.ID DESC;
             """;
