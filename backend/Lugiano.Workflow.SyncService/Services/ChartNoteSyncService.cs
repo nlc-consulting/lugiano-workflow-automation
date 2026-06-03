@@ -11,17 +11,20 @@ namespace Lugiano.Workflow.SyncService.Services;
 public sealed class ChartNoteSyncService
 {
     private readonly IChartNoteReadQueries _reads;
+    private readonly IPatientStatusQueries _status;
     private readonly WorkflowCaseService _cases;
     private readonly SyncStateService _syncState;
     private readonly ILogger<ChartNoteSyncService> _logger;
 
     public ChartNoteSyncService(
         IChartNoteReadQueries reads,
+        IPatientStatusQueries status,
         WorkflowCaseService cases,
         SyncStateService syncState,
         ILogger<ChartNoteSyncService> logger)
     {
         _reads = reads;
+        _status = status;
         _cases = cases;
         _syncState = syncState;
         _logger = logger;
@@ -53,10 +56,15 @@ public sealed class ChartNoteSyncService
             ct.ThrowIfCancellationRequested();
             try
             {
+                // Reconcile the WHOLE patient, not just this note: pull current
+                // insurance + notes truth (real dates) so the case reflects reality.
+                var status = await _status.GetStatusAsync(note.PatientId);
                 int caseId = await _cases.CreateOrUpdateCaseAsync(
                     note.PatientId, patient.FirstName, patient.LastName,
-                    WorkflowStates.ReadyForAiScrubbing,
-                    doctorNotesReceivedAt: DateTime.UtcNow);
+                    hasInsurance: status.HasInsurance,
+                    insuranceAddedAt: status.InsuranceEffectiveDate,
+                    hasNotes: status.HasNotes,
+                    doctorNotesReceivedAt: status.LatestNoteDate);
                 casesTouched++;
 
                 if (!await _cases.DoctorNoteExistsAsync(note.Id))
@@ -93,8 +101,8 @@ public sealed class ChartNoteSyncService
                     });
                     eventsCreated++;
                     _logger.LogInformation(
-                        "ChartNotes: case {CaseId} (patient {PatientId}) -> {State}, event DoctorNoteReceived (note {NoteId}).",
-                        caseId, note.PatientId, WorkflowStates.ReadyForAiScrubbing, note.Id);
+                        "ChartNotes: case {CaseId} (patient {PatientId}) reconciled, event DoctorNoteReceived (note {NoteId}).",
+                        caseId, note.PatientId, note.Id);
                 }
 
                 if (note.Id > maxProcessedId)
