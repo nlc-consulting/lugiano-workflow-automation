@@ -14,6 +14,7 @@ public sealed class ChartNoteSyncService
     private readonly IPatientStatusQueries _status;
     private readonly WorkflowCaseService _cases;
     private readonly SyncStateService _syncState;
+    private readonly CorrectionRequestService _corrections;
     private readonly ILogger<ChartNoteSyncService> _logger;
 
     public ChartNoteSyncService(
@@ -21,12 +22,14 @@ public sealed class ChartNoteSyncService
         IPatientStatusQueries status,
         WorkflowCaseService cases,
         SyncStateService syncState,
+        CorrectionRequestService corrections,
         ILogger<ChartNoteSyncService> logger)
     {
         _reads = reads;
         _status = status;
         _cases = cases;
         _syncState = syncState;
+        _corrections = corrections;
         _logger = logger;
     }
 
@@ -104,6 +107,11 @@ public sealed class ChartNoteSyncService
                         "ChartNotes: case {CaseId} (patient {PatientId}) reconciled, event DoctorNoteReceived (note {NoteId}).",
                         caseId, note.PatientId, note.Id);
                 }
+
+                // Auto-resolve any open kickback for this patient: a new note
+                // arriving is the doctor's response (whether it's a fresh chart
+                // entry or a corrected one).
+                await _corrections.ResolveOpenForPatientAsync(note.PatientId, ct);
 
                 if (note.Id > maxProcessedId)
                     maxProcessedId = note.Id;
