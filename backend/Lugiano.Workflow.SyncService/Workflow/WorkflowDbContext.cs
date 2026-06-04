@@ -14,6 +14,9 @@ public sealed class WorkflowDbContext : DbContext
     public DbSet<WorkflowCase> WorkflowCases => Set<WorkflowCase>();
     public DbSet<WorkflowEvent> WorkflowEvents => Set<WorkflowEvent>();
     public DbSet<DoctorNote> DoctorNotes => Set<DoctorNote>();
+    public DbSet<Doctor> Doctors => Set<Doctor>();
+    public DbSet<CorrectionRequest> CorrectionRequests => Set<CorrectionRequest>();
+    public DbSet<ScrubResult> ScrubResults => Set<ScrubResult>();
 
     // SQL Server datetime2 doesn't store DateTimeKind. We always write UTC, so stamp
     // reads as UTC — this makes the JSON include the 'Z' so clients convert correctly.
@@ -88,6 +91,45 @@ public sealed class WorkflowDbContext : DbContext
             e.Property(x => x.CreatedAt).HasDefaultValueSql("SYSUTCDATETIME()");
             // Idempotency: one DoctorNote per ChartNote.
             e.HasIndex(x => x.ChartNoteId).IsUnique();
+        });
+
+        b.Entity<Doctor>(e =>
+        {
+            e.ToTable("Doctor");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.FullName).HasMaxLength(200);
+            e.Property(x => x.Credentials).HasMaxLength(100);
+            e.Property(x => x.Npi).HasMaxLength(20);
+            e.Property(x => x.Email).HasMaxLength(254); // RFC 5321 cap
+            e.Property(x => x.CreatedAt).HasDefaultValueSql("SYSUTCDATETIME()");
+            e.Property(x => x.UpdatedAt).HasDefaultValueSql("SYSUTCDATETIME()");
+            // One row per ChiroTouch doctor ID (the link back to PSChiro).
+            e.HasIndex(x => x.ChiroTouchDoctorId).IsUnique();
+        });
+
+        b.Entity<CorrectionRequest>(e =>
+        {
+            e.ToTable("CorrectionRequest");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.State).HasMaxLength(40).IsRequired();
+            e.Property(x => x.ReviewerEmail).HasMaxLength(254);
+            e.Property(x => x.RecipientOverrideEmail).HasMaxLength(254);
+            e.Property(x => x.CreatedAt).HasDefaultValueSql("SYSUTCDATETIME()");
+            // Most lookups are "open requests for this note" — index supports that.
+            e.HasIndex(x => new { x.DoctorNoteId, x.State });
+            e.HasIndex(x => x.WorkflowCaseId);
+        });
+
+        b.Entity<ScrubResult>(e =>
+        {
+            e.ToTable("ScrubResult");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Verdict).HasMaxLength(40).IsRequired();
+            e.Property(x => x.ModelUsed).HasMaxLength(80).IsRequired();
+            e.Property(x => x.PromptVersion).HasMaxLength(40).IsRequired();
+            e.Property(x => x.RanAt).HasDefaultValueSql("SYSUTCDATETIME()");
+            // "Latest result for this note" is the hot lookup — index it.
+            e.HasIndex(x => new { x.DoctorNoteId, x.RanAt });
         });
     }
 }
