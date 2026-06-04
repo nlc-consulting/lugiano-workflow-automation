@@ -6,6 +6,29 @@ public static class WorkflowStates
     public const string AwaitingPipVerification = "AwaitingPipVerification";
     public const string AwaitingDoctorNotes = "AwaitingDoctorNotes";
     public const string ReadyForAiScrubbing = "ReadyForAiScrubbing";
+    // Note has been sent back to the doctor; resumes the cascade when a
+    // corrected ChartNote arrives via sync.
+    public const string AwaitingDoctorCorrection = "AwaitingDoctorCorrection";
+}
+
+// Lifecycle of a single CorrectionRequest. Pending = created but not yet
+// emailed; Sent = email dispatched; Resolved = corrected note arrived and
+// auto-cleared; Escalated = hit the round cap, needs manual handling.
+public static class CorrectionStates
+{
+    public const string Pending = "Pending";
+    public const string Sent = "Sent";
+    public const string Resolved = "Resolved";
+    public const string Escalated = "Escalated";
+}
+
+// Possible scrubber verdicts. Pass = ready for billing; NeedsReview = minor
+// issues, reviewer should glance; Fail = significant issues, kickback warranted.
+public static class ScrubVerdicts
+{
+    public const string Pass = "pass";
+    public const string NeedsReview = "needs_review";
+    public const string Fail = "fail";
 }
 
 // Snapshot of a patient's billing-readiness flags. Owns the cascade so adding a

@@ -23,9 +23,12 @@ public sealed class SourceDbConnectionFactory : ISourceDbConnectionFactory
 
     public SqlConnection Create()
     {
-        // Resolved lazily: the ChiroTouch connection string is intentionally not
-        // configured yet, so the service can start and run migrations without it.
-        // This throws only if a poll actually tries to read the source DB.
+        // PROTOTYPE: connection string (including the lugiano_ro password) lives
+        // in appsettings.Development.json today. Production must source it from a
+        // secrets store (Azure Key Vault / AWS Secrets Manager / env vars) — same
+        // applies to the WorkflowAutomation connection string in Program.cs.
+        // Resolved lazily so the service still starts and runs migrations when
+        // ChiroTouch isn't configured; only throws if a poll actually needs it.
         var connectionString = _configuration.GetConnectionString("ChiroTouch");
         if (string.IsNullOrWhiteSpace(connectionString))
             throw new InvalidOperationException("Connection string 'ChiroTouch' is not configured.");
