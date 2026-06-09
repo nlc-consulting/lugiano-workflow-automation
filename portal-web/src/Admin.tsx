@@ -8,6 +8,7 @@ import workflowDataProvider from './workflowDataProvider'
 import UserList from './users/UserList'
 import CaseList from './cases/CaseList'
 import CaseShow from './cases/CaseShow'
+import Login from './Login'
 
 const LUGIANO_RED = '#E11D2A'
 
@@ -30,6 +31,7 @@ export const AppAdmin = () => (
     dataProvider={dataProvider}
     authProvider={authProvider}
     theme={theme}
+    loginPage={Login}
     title="Lugiano Portal"
   >
     <Resource
