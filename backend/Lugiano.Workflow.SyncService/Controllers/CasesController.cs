@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Lugiano.Workflow.SyncService.ChiroTouch;
 using Lugiano.Workflow.SyncService.Services;
 using Lugiano.Workflow.SyncService.Util;
@@ -84,7 +83,6 @@ public sealed class CasesController : ControllerBase
         var chargeRows = await _detail.GetChargesForVisitsAsync(matchedVisitIds);
 
         var notes = new List<object>();
-        var plainTexts = new List<string>();
         var textBudget = 3;
         foreach (var n in noteRows)
         {
@@ -95,7 +93,6 @@ public sealed class CasesController : ControllerBase
                 try { text = RtfConverter.ToPlainText(await _noteReads.GetNoteRtfAsync(ptr)); }
                 catch { text = null; }
             }
-            if (!string.IsNullOrEmpty(text)) plainTexts.Add(text);
             var (matchScore, matchReasons) = ScoreVisitMatch(n);
 
             notes.Add(new
@@ -116,21 +113,12 @@ public sealed class CasesController : ControllerBase
             });
         }
 
-        // ChiroTouch embeds diagnoses inside the chart-note RTF rather than in a
-        // clean table, so we extract ICD-10 codes from the reconstructed plain
-        // text and look up descriptions from the DiagnosesItems catalog. The
-        // regex requires a period (e.g. M54.12) to avoid false positives like
-        // HCPCS codes (G0283, A4556) that look like ICD on the left side.
-        var distinctCodes = plainTexts
-            .SelectMany(t => IcdPattern.Matches(t).Select(m => m.Value))
-            .Distinct()
-            .ToList();
-        var descMap = distinctCodes.Count > 0
-            ? await _detail.GetDiagnosisDescriptionsAsync(distinctCodes)
-            : new Dictionary<string, string>();
-        var diagnoses = distinctCodes
-            .OrderBy(c => c, StringComparer.Ordinal)
-            .Select(c => new { code = c, description = descMap.GetValueOrDefault(c) })
+        // Diagnoses live in dbo.Diagnoses keyed by AppointmentID (PatientID
+        // column on those rows is typically NULL). Join through Appointments
+        // gets the patient's full active diagnosis set with descriptions already
+        // populated — no catalog lookup needed.
+        var diagnoses = (await _detail.GetPatientDiagnosesAsync(id))
+            .Select(d => new { code = d.Code, description = d.Description })
             .ToList();
 
         await using var db = await _factory.CreateDbContextAsync();
@@ -229,13 +217,6 @@ public sealed class CasesController : ControllerBase
         catch { /* fall through */ }
         return (0, 25);
     }
-
-    // ICD-10 pattern: letter + 2 digits + REQUIRED period + 1-4 alphanumerics
-    // (e.g. M54.12, S43.402A). Requiring the period excludes HCPCS codes like
-    // G0283 and A4556 that share the leading shape but are CPT-side, not Dx.
-    private static readonly Regex IcdPattern = new(
-        @"\b[A-Z]\d{2}\.\d{1,4}[A-Z]?\b",
-        RegexOptions.Compiled);
 
     // Heuristic note->visit match score (0-100). Start at 100, deduct per weakness;
     // tune the weights here as Jacob calibrates against real reviews.

@@ -51,13 +51,24 @@ builder.Services.AddSingleton<ChartNoteSyncService>();
 builder.Services.AddSingleton<DoctorSyncService>();
 builder.Services.AddSingleton<CorrectionRequestService>();
 
-// Email sender selection: real SMTP if Email:Smtp:Host is configured, otherwise
-// the demo-safe FileEmailSender that writes .eml files to disk. Flip from file
-// to SMTP later with a config-only change — no code edits needed.
-if (!string.IsNullOrWhiteSpace(builder.Configuration["Email:Smtp:Host"]))
-    builder.Services.AddSingleton<IEmailSender, SmtpEmailSender>();
-else
-    builder.Services.AddSingleton<IEmailSender, FileEmailSender>();
+// Email sender selection. SMTP if Email:Smtp:Host is set, otherwise the
+// FileEmailSender that writes .eml files to disk. Wrapped with a dev-override
+// decorator when Email:DevOverrideRecipient is configured — all outgoing
+// emails route to that single address until the override is removed.
+builder.Services.AddSingleton<IEmailSender>(sp =>
+{
+    var config = sp.GetRequiredService<IConfiguration>();
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+
+    IEmailSender baseSender = !string.IsNullOrWhiteSpace(config["Email:Smtp:Host"])
+        ? new SmtpEmailSender(config, loggerFactory.CreateLogger<SmtpEmailSender>())
+        : new FileEmailSender(config, loggerFactory.CreateLogger<FileEmailSender>());
+
+    var devOverride = config["Email:DevOverrideRecipient"];
+    return !string.IsNullOrWhiteSpace(devOverride)
+        ? new DevOverrideEmailSender(baseSender, devOverride, loggerFactory.CreateLogger<DevOverrideEmailSender>())
+        : baseSender;
+});
 
 // Scrubbing: named HttpClient + Claude integration + orchestrator.
 // Named client (vs typed) avoids captive-HttpClient issues when consumed by

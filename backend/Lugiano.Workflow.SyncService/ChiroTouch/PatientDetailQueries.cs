@@ -51,6 +51,8 @@ public sealed record ChartNoteRow(
     string? VisitDoctor,
     int VisitsSameDay);
 
+public sealed record PatientDiagnosisRow(string Code, string? Description);
+
 public interface IPatientDetailQueries
 {
     bool IsConfigured { get; }
@@ -58,7 +60,7 @@ public interface IPatientDetailQueries
     Task<IReadOnlyList<InsurancePolicyRow>> GetPoliciesAsync(int patientId);
     Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take);
     Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds);
-    Task<IReadOnlyDictionary<string, string>> GetDiagnosisDescriptionsAsync(IEnumerable<string> codes);
+    Task<IReadOnlyList<PatientDiagnosisRow>> GetPatientDiagnosesAsync(int patientId);
 }
 
 // READ-ONLY patient detail reads from ChiroTouch (lugiano_ro). SELECT only.
@@ -109,32 +111,22 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
         return (await conn.QueryAsync<InsurancePolicyRow>(sql, new { patientId })).ToList();
     }
 
-    public async Task<IReadOnlyDictionary<string, string>> GetDiagnosisDescriptionsAsync(IEnumerable<string> codes)
+    public async Task<IReadOnlyList<PatientDiagnosisRow>> GetPatientDiagnosesAsync(int patientId)
     {
-        var codeList = codes.Where(c => !string.IsNullOrWhiteSpace(c)).Distinct().ToList();
-        if (codeList.Count == 0) return new Dictionary<string, string>();
-
         await using var conn = _sourceDb.Create();
-        // DiagnosesItems has multiple rows per code (the practice has added variants
-        // over time). Lowest ID = original/canonical entry, which matches what
-        // ChiroTouch's UI displays. Small filtered set + window — friendly to PSChiro.
+        // Diagnoses rows are keyed by AppointmentID; PatientID on the row is
+        // typically NULL. Join through Appointments to get the patient's full
+        // active diagnosis set. DISTINCT collapses duplicates across visits.
         const string sql =
             """
-            WITH ranked AS (
-                SELECT Code, Name,
-                       ROW_NUMBER() OVER (PARTITION BY Code ORDER BY ID) AS rn
-                FROM   dbo.DiagnosesItems
-                WHERE  Code IN @codes
-            )
-            SELECT Code, Name
-            FROM   ranked
-            WHERE  rn = 1;
+            SELECT DISTINCT d.Code AS Code, d.Description AS Description
+            FROM   dbo.Diagnoses d
+            JOIN   dbo.Appointments a ON a.ID = d.AppointmentID
+            WHERE  a.PatientID = @patientId
+            ORDER BY d.Code;
             """;
-        var rows = await conn.QueryAsync<CodeDescription>(sql, new { codes = codeList });
-        return rows.ToDictionary(r => r.Code, r => r.Name);
+        return (await conn.QueryAsync<PatientDiagnosisRow>(sql, new { patientId })).ToList();
     }
-
-    private sealed record CodeDescription(string Code, string Name);
 
     public async Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds)
     {
