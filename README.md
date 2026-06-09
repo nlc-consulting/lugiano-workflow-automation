@@ -18,8 +18,8 @@ events and state in a separate **WorkflowAutomation** database.
 | Source database      | `PSChiro` / ChiroTouch (SQL Server) — **read-only**           |
 | Target database      | `WorkflowAutomation` (SQL Server)                             |
 | Prototype service    | .NET 8 Worker Service                                         |
-| Source data access   | Dapper (read-only queries)                                    |
-| Workflow data access | EF Core or Dapper                                             |
+| Source data access   | Dapper (read-only queries against the legacy ChiroTouch schema) |
+| Workflow data access | EF Core 8 (code-first, migrations own the schema)             |
 | Config               | Connection strings live in `appsettings.json`                |
 
 ### Hard rules
@@ -194,6 +194,31 @@ Console logs should report each cycle:
 - Number of new chart notes found
 - Workflow cases created / updated
 - Latest sync state values
+
+---
+
+## Running the worker
+
+The WorkflowAutomation schema is **code-first**; EF Core migrations own it (no
+hand-written DDL). On startup the worker applies any pending migrations, so the DB
+is created/upgraded automatically.
+
+```
+# 1. Set both connection strings in
+#    backend/Lugiano.Workflow.SyncService/appsettings.json
+#      - ChiroTouch (read-only source)
+#      - WorkflowAutomation (target; the login needs create/alter on first run)
+
+# 2. Run the worker (applies migrations, then begins polling every 30s)
+dotnet run --project backend/Lugiano.Workflow.SyncService
+```
+
+To manage the schema by hand instead of auto-migrating:
+
+```
+dotnet ef database update   --project backend/Lugiano.Workflow.SyncService
+dotnet ef migrations add <Name> --project backend/Lugiano.Workflow.SyncService
+```
 
 ---
 
