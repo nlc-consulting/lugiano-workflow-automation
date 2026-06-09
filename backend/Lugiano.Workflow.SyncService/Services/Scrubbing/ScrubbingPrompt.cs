@@ -48,10 +48,23 @@ public static class ScrubbingPrompt
         Return your analysis ONLY via the submit_scrub_findings tool.
         """;
 
-    public static string GetSystemPrompt(IConfiguration config) =>
-        config["Anthropic:SystemPrompt"] is { Length: > 0 } overridden
-            ? overridden
+    // Resolves the active system prompt. Precedence (re-checked every call so
+    // editing the file mid-session takes effect on the next Re-scrub):
+    //   1. Anthropic:SystemPromptFile  -> read .md/.txt from disk
+    //   2. Anthropic:SystemPrompt      -> inline string in appsettings
+    //   3. DefaultSystemPrompt         -> the constant above
+    public static string GetSystemPrompt(IConfiguration config)
+    {
+        var filePath = config["Anthropic:SystemPromptFile"] ?? "prompts/scrub-system.md";
+        if (!string.IsNullOrWhiteSpace(filePath) && File.Exists(filePath))
+        {
+            try { return File.ReadAllText(filePath); }
+            catch { /* fall through to inline / default */ }
+        }
+        return config["Anthropic:SystemPrompt"] is { Length: > 0 } inline
+            ? inline
             : DefaultSystemPrompt;
+    }
 
     public static string GetPromptVersion(IConfiguration config) =>
         config["Anthropic:PromptVersion"] is { Length: > 0 } v ? v : DefaultPromptVersion;

@@ -95,13 +95,14 @@ public sealed class ScrubOrchestrator
                 .ToList()
             : Array.Empty<ScrubCharge>();
 
-        // Patient diagnoses we've already extracted from prior plain-text notes
-        // could be reused, but for the scrub we keep it simple: pull from the
-        // visit's ChargeDxs (already on each charge) — the model can dedupe.
-        var diagnoses = charges
-            .SelectMany(c => (c.Diagnoses ?? string.Empty)
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            .Distinct()
+        // Patient's documented diagnoses from dbo.Diagnoses (joined through
+        // Appointments). This is the canonical source — catches codes the
+        // doctor documented but hasn't billed yet (visible to scrubber as
+        // missing alignment between docs and bill).
+        var diagnoses = (await _detail.GetPatientDiagnosesAsync(note.PatientId))
+            .Select(d => string.IsNullOrEmpty(d.Description)
+                ? d.Code
+                : $"{d.Code} {d.Description}")
             .ToList();
 
         // Prior notes (most recent excluding this one) for consistency context.
