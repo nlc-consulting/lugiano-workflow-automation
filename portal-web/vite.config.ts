@@ -5,6 +5,9 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Vite rejects requests whose Host header isn't in this list — add any
+    // ngrok / tunnel domains you share the dev server through.
+    allowedHosts: ['localhost', 'ngrok.nlc.consulting'],
     proxy: {
       // Portal API (NestJS): auth, users, portal data.
       '/api': 'http://localhost:3000',
