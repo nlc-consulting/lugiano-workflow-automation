@@ -95,26 +95,29 @@ public sealed class ScrubOrchestrator
                 .ToList()
             : Array.Empty<ScrubCharge>();
 
-        // Patient's documented diagnoses from dbo.Diagnoses (joined through
-        // Appointments). This is the canonical source — catches codes the
-        // doctor documented but hasn't billed yet (visible to scrubber as
-        // missing alignment between docs and bill).
-        var diagnoses = (await _detail.GetPatientDiagnosesAsync(note.PatientId))
-            .Select(d => string.IsNullOrEmpty(d.Description)
-                ? d.Code
-                : $"{d.Code} {d.Description}")
-            .ToList();
+        // Documented diagnoses for this note's visit, from dbo.Diagnoses (the
+        // canonical DX source, Seq-ordered). Scoping to the matched visit keeps
+        // the scrubber's view identical to ChiroTouch's chart-note DX panel — the
+        // same list the portal shows — so its docs-vs-bill alignment check runs
+        // against the codes actually documented on this visit.
+        IReadOnlyList<string> diagnoses = visitId.HasValue
+            ? (await _detail.GetDiagnosesForVisitsAsync(new[] { visitId.Value }))
+                .Select(d => string.IsNullOrEmpty(d.Description)
+                    ? d.Code
+                    : $"{d.Code} {d.Description}")
+                .ToList()
+            : Array.Empty<string>();
 
-        // Prior notes (most recent excluding this one) for consistency context.
-        // Cap text length per note to keep the prompt manageable.
-        var priorNotes = (await db.DoctorNotes
+        // Every other note for the patient (newest first), excluding the one
+        // being scrubbed. Each plain-text body is capped to keep the prompt
+        // manageable; the model still sees the full set of dates.
+        var otherNotes = (await db.DoctorNotes
             .AsNoTracking()
             .Where(n => n.PatientId == note.PatientId && n.Id != note.Id && n.PlainText != null)
             .OrderByDescending(n => n.NoteDate)
-            .Take(2)
             .Select(n => new { n.NoteDate, n.PlainText })
             .ToListAsync(ct))
-            .Select(n => new ScrubPriorNote(n.NoteDate, Truncate(n.PlainText, 2000)))
+            .Select(n => new ScrubOtherNote(n.NoteDate, Truncate(n.PlainText, 2000)))
             .ToList();
 
         return new ScrubContext(
@@ -124,7 +127,7 @@ public sealed class ScrubOrchestrator
             NoteText: note.PlainText ?? string.Empty,
             VisitCharges: charges,
             PatientDiagnoses: diagnoses,
-            PriorNotes: priorNotes);
+            OtherNotes: otherNotes);
     }
 
     private static string Truncate(string? s, int max) =>

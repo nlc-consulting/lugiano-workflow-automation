@@ -35,11 +35,16 @@ public static class ScrubVerdicts
 // new gate (signature, charges, scrub-passed, etc.) is a property + one branch
 // here rather than a signature change at every call site. Always construct with
 // named args so the boolean parameters stay readable.
+//
+// NOTE: PIP is currently hidden from the UI and bypassed in the cascade — it
+// isn't part of the billing critical path right now. The Pip field stays in
+// the record (call sites still pass it) and the AwaitingPipVerification state
+// constant stays, so reintroducing the gate is a one-line uncomment.
 public readonly record struct BillingReadiness(bool Insurance, bool Pip, bool Notes)
 {
     public string DerivedState =>
         !Insurance ? WorkflowStates.AwaitingInsurance
-        : !Pip     ? WorkflowStates.AwaitingPipVerification
+        // : !Pip  ? WorkflowStates.AwaitingPipVerification   // PIP gate — see note above
         : !Notes   ? WorkflowStates.AwaitingDoctorNotes
         : WorkflowStates.ReadyForAiScrubbing;
 }

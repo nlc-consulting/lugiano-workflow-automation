@@ -22,8 +22,14 @@ EVALUATION CRITERIA
    the specific regions adjusted; 97140 manual therapy should describe the
    techniques used).
 
-4. Consistency — assessment should be consistent with prior notes for
-   ongoing conditions when prior notes are provided.
+4. Holistic alignment — when other notes for the patient are provided,
+   evaluate the focal note against the full clinical history, not in
+   isolation. Look across the entire set for:
+   - Diagnoses documented somewhere in the history but never billed against
+   - Charges billed today (or repeatedly) that the narrative across visits
+     doesn't justify
+   - Treatment plans that drift or contradict prior visits without explanation
+   - Ongoing conditions whose assessment is inconsistent with prior notes
 
 VERDICT GUIDANCE
 - pass: meets all criteria. Ready to bill.

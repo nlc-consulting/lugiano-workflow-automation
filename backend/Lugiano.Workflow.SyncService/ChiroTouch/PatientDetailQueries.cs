@@ -51,7 +51,7 @@ public sealed record ChartNoteRow(
     string? VisitDoctor,
     int VisitsSameDay);
 
-public sealed record PatientDiagnosisRow(string Code, string? Description);
+public sealed record VisitDiagnosisRow(int AppointmentId, string Code, string? Description);
 
 public interface IPatientDetailQueries
 {
@@ -60,7 +60,10 @@ public interface IPatientDetailQueries
     Task<IReadOnlyList<InsurancePolicyRow>> GetPoliciesAsync(int patientId);
     Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take);
     Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds);
-    Task<IReadOnlyList<PatientDiagnosisRow>> GetPatientDiagnosesAsync(int patientId);
+    // Per-visit diagnosis sets, keyed by appointment, Seq-ordered. Used by both
+    // the portal detail view and the AI scrubber so they share one DX list that
+    // mirrors ChiroTouch's per-note DX panel exactly.
+    Task<IReadOnlyList<VisitDiagnosisRow>> GetDiagnosesForVisitsAsync(IEnumerable<int> appointmentIds);
 }
 
 // READ-ONLY patient detail reads from ChiroTouch (lugiano_ro). SELECT only.
@@ -111,21 +114,28 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
         return (await conn.QueryAsync<InsurancePolicyRow>(sql, new { patientId })).ToList();
     }
 
-    public async Task<IReadOnlyList<PatientDiagnosisRow>> GetPatientDiagnosesAsync(int patientId)
+    public async Task<IReadOnlyList<VisitDiagnosisRow>> GetDiagnosesForVisitsAsync(IEnumerable<int> appointmentIds)
     {
+        var ids = appointmentIds.Distinct().ToList();
+        if (ids.Count == 0) return Array.Empty<VisitDiagnosisRow>();
+
         await using var conn = _sourceDb.Create();
-        // Diagnoses rows are keyed by AppointmentID; PatientID on the row is
-        // typically NULL. Join through Appointments to get the patient's full
-        // active diagnosis set. DISTINCT collapses duplicates across visits.
+        // Diagnoses are keyed by AppointmentID, mirroring ChiroTouch's chart-note
+        // DX panel: each visit carries its own ordered set and Seq is the on-screen
+        // priority order. Scoping to the note's matched visit — rather than the
+        // patient-wide union — is what keeps the list identical to ChiroTouch and
+        // free of codes carried only by other visits (e.g. a subsequent-encounter
+        // sprain entered on a different day).
         const string sql =
             """
-            SELECT DISTINCT d.Code AS Code, d.Description AS Description
+            SELECT d.AppointmentID AS AppointmentId,
+                   d.Code          AS Code,
+                   d.Description    AS Description
             FROM   dbo.Diagnoses d
-            JOIN   dbo.Appointments a ON a.ID = d.AppointmentID
-            WHERE  a.PatientID = @patientId
-            ORDER BY d.Code;
+            WHERE  d.AppointmentID IN @ids
+            ORDER BY d.AppointmentID, d.Seq;
             """;
-        return (await conn.QueryAsync<PatientDiagnosisRow>(sql, new { patientId })).ToList();
+        return (await conn.QueryAsync<VisitDiagnosisRow>(sql, new { ids })).ToList();
     }
 
     public async Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds)
@@ -208,6 +218,7 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
                     ABS(DATEDIFF(MINUTE, a.ScheduleDateTime, cn.NoteDate))
             ) v
             WHERE  cn.PatientID = @patientId
+              AND  cn.SOAPPtr <> 0   -- skip empty placeholder notes; ChiroTouch UI hides these
             ORDER BY cn.NoteDate DESC, cn.ID DESC;
             """;
         return (await conn.QueryAsync<ChartNoteRow>(sql, new { patientId, take })).ToList();

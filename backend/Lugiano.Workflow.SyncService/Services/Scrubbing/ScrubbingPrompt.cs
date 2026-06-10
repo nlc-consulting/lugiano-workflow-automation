@@ -6,7 +6,7 @@ namespace Lugiano.Workflow.SyncService.Services.Scrubbing;
 // produced them — important for calibration once we have history.
 public static class ScrubbingPrompt
 {
-    public const string DefaultPromptVersion = "v1-2026-06-03";
+    public const string DefaultPromptVersion = "v2-holistic-2026-06-05";
 
     public const string DefaultSystemPrompt = """
         You are a medical billing scrubber for a chiropractic practice. Your job is

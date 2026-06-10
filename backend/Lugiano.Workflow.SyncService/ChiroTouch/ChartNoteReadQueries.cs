@@ -14,6 +14,11 @@ public interface IChartNoteReadQueries
     Task<IReadOnlyList<(SourceChartNote Note, SourcePatient Patient)>> GetNewChartNotesAsync(
         long lastSeenId);
 
+    // Every chart note for one patient, oldest first. Used to backfill the
+    // full history when we encounter a patient for the first time.
+    Task<IReadOnlyList<(SourceChartNote Note, SourcePatient Patient)>> GetAllChartNotesForPatientAsync(
+        int patientId);
+
     // Reconstruct a note's RTF by walking ChartText: SOAPPtr -> Ptr, following
     // NextPtr until it is 0, concatenating each TextBody chunk.
     Task<string?> GetNoteRtfAsync(int soapPtr);
@@ -56,6 +61,7 @@ public sealed class ChartNoteReadQueries : IChartNoteReadQueries
             FROM    dbo.ChartNotes cn
             JOIN    dbo.Patients p ON p.ID = cn.PatientID
             WHERE   cn.ID > @lastSeenId
+              AND   cn.SOAPPtr <> 0   -- skip empty placeholder notes; ChiroTouch UI hides these
             ORDER BY cn.ID ASC;
             """;
 
@@ -63,6 +69,37 @@ public sealed class ChartNoteReadQueries : IChartNoteReadQueries
             sql,
             (note, patient) => (note, patient),
             new { lastSeenId },
+            splitOn: "Id");
+
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<(SourceChartNote Note, SourcePatient Patient)>> GetAllChartNotesForPatientAsync(
+        int patientId)
+    {
+        await using var conn = _sourceDb.Create();
+        const string sql =
+            """
+            SELECT  cn.ID        AS Id,
+                    cn.PatientID AS PatientId,
+                    cn.DoctorID  AS DoctorId,
+                    cn.NoteDate  AS NoteDate,
+                    cn.SOAPPtr   AS SoapPtr,
+                    cn.Status    AS Status,
+                    p.ID         AS Id,
+                    p.FirstName  AS FirstName,
+                    p.LastName   AS LastName
+            FROM    dbo.ChartNotes cn
+            JOIN    dbo.Patients p ON p.ID = cn.PatientID
+            WHERE   cn.PatientID = @patientId
+              AND   cn.SOAPPtr <> 0   -- skip empty placeholder notes; ChiroTouch UI hides these
+            ORDER BY cn.ID ASC;
+            """;
+
+        var rows = await conn.QueryAsync<SourceChartNote, SourcePatient, (SourceChartNote, SourcePatient)>(
+            sql,
+            (note, patient) => (note, patient),
+            new { patientId },
             splitOn: "Id");
 
         return rows.ToList();

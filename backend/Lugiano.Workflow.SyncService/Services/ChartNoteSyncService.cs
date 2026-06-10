@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Lugiano.Workflow.SyncService.ChiroTouch;
+using Lugiano.Workflow.SyncService.ChiroTouch.Models;
 using Lugiano.Workflow.SyncService.Workflow.Models;
 using Lugiano.Workflow.SyncService.Util;
 using Microsoft.Extensions.Logging;
@@ -70,25 +71,28 @@ public sealed class ChartNoteSyncService
                     doctorNotesReceivedAt: status.LatestNoteDate);
                 casesTouched++;
 
-                if (!await _cases.DoctorNoteExistsAsync(note.Id))
+                // First time we've encountered this patient → backfill their
+                // entire historical note set from ChiroTouch before processing
+                // the trigger note. Idempotent: re-runs no-op via existence
+                // check. Subsequent polls for the same patient skip this block.
+                if (!await _cases.PatientHasAnyDoctorNoteAsync(note.PatientId))
                 {
-                    string? rawRtf = note.SoapPtr is int ptr and not 0
-                        ? await _reads.GetNoteRtfAsync(ptr)
-                        : null;
-                    string? plainText = RtfConverter.ToPlainText(rawRtf);
-
-                    await _cases.InsertDoctorNoteAsync(new DoctorNote
+                    var history = await _reads.GetAllChartNotesForPatientAsync(note.PatientId);
+                    if (history.Count > 0)
                     {
-                        WorkflowCaseId = caseId,
-                        PatientId = note.PatientId,
-                        ChartNoteId = note.Id,
-                        DoctorId = note.DoctorId,
-                        NoteDate = note.NoteDate,
-                        SoapPtr = note.SoapPtr,
-                        RawRtf = rawRtf,
-                        PlainText = plainText
-                    });
+                        _logger.LogInformation(
+                            "ChartNotes: first encounter with patient {PatientId} — backfilling {Count} historical note(s).",
+                            note.PatientId, history.Count);
+                        foreach (var (h, _) in history)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            await EnsureDoctorNoteSavedAsync(caseId, h);
+                        }
+                    }
                 }
+
+                // Trigger note itself. No-op if the backfill above already saved it.
+                await EnsureDoctorNoteSavedAsync(caseId, note);
 
                 if (!await _cases.WorkflowEventExistsAsync(SourceTables.ChartNotes, note.Id))
                 {
@@ -127,5 +131,39 @@ public sealed class ChartNoteSyncService
         }
 
         return new SyncResult(rows.Count, casesTouched, eventsCreated);
+    }
+
+    // Inserts a DoctorNote row for a single source ChartNote, reconstructing
+    // the RTF and plain text along the way. Idempotent — exits cleanly if the
+    // ChartNoteId is already in our table. One bad RTF chain logs and stores
+    // null text rather than breaking the whole sync.
+    private async Task EnsureDoctorNoteSavedAsync(int caseId, SourceChartNote note)
+    {
+        if (await _cases.DoctorNoteExistsAsync(note.Id)) return;
+
+        string? rawRtf = null;
+        try
+        {
+            if (note.SoapPtr is int ptr and not 0)
+                rawRtf = await _reads.GetNoteRtfAsync(ptr);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "ChartNotes: RTF reconstruction failed for note {NoteId}; storing without text.",
+                note.Id);
+        }
+
+        await _cases.InsertDoctorNoteAsync(new DoctorNote
+        {
+            WorkflowCaseId = caseId,
+            PatientId = note.PatientId,
+            ChartNoteId = note.Id,
+            DoctorId = note.DoctorId,
+            NoteDate = note.NoteDate,
+            SoapPtr = note.SoapPtr,
+            RawRtf = rawRtf,
+            PlainText = RtfConverter.ToPlainText(rawRtf),
+        });
     }
 }

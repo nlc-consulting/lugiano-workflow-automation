@@ -120,6 +120,15 @@ public sealed class WorkflowCaseService
         return await db.DoctorNotes.AnyAsync(x => x.ChartNoteId == chartNoteId);
     }
 
+    // True when we already have at least one DoctorNote for this patient.
+    // Used by the sync service to decide whether to trigger a full history
+    // backfill on first encounter.
+    public async Task<bool> PatientHasAnyDoctorNoteAsync(int patientId)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        return await db.DoctorNotes.AnyAsync(x => x.PatientId == patientId);
+    }
+
     public async Task InsertDoctorNoteAsync(DoctorNote note)
     {
         await using var db = await _dbFactory.CreateDbContextAsync();

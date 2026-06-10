@@ -125,10 +125,10 @@ public sealed class ClaudeScrubber : IScrubber
                 sb.AppendLine($"- {d}");
         sb.AppendLine();
 
-        if (ctx.PriorNotes.Count > 0)
+        if (ctx.OtherNotes.Count > 0)
         {
-            sb.AppendLine("=== RECENT PRIOR NOTES (for consistency check) ===");
-            foreach (var p in ctx.PriorNotes)
+            sb.AppendLine($"=== PATIENT'S OTHER NOTES ({ctx.OtherNotes.Count}, for holistic review) ===");
+            foreach (var p in ctx.OtherNotes)
             {
                 sb.Append("Date: ");
                 sb.AppendLine(p.NoteDate?.ToString("yyyy-MM-dd") ?? "unknown");
