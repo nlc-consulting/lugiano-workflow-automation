@@ -123,7 +123,7 @@ public sealed class CasesController : ControllerBase
 
             return new CaseDto(
                 c.PatientId, c.PatientId, c.FirstName, c.LastName,
-                new BillingReadiness(Insurance: insurance, Pip: pip, Notes: notes).DerivedState,
+                DeriveDashboardState(insurance, pip, notes, scrub?.Verdict, outstanding?.Count ?? 0),
                 insurance, notes, pip,
                 c.InsuranceAddedAt, c.DoctorNotesReceivedAt, c.PipVerifiedAt,
                 c.CreatedAt, c.UpdatedAt,
@@ -379,9 +379,20 @@ public sealed class CasesController : ControllerBase
         var hasNotes = noteRows.Count > 0;
         var pip = wc?.PipVerifiedAt != null;
         // Always derive from the live ChiroTouch truth so the detail can't drift
-        // from a stale stored state.
-        var state = new BillingReadiness(
-            Insurance: insurance, Pip: pip, Notes: hasNotes).DerivedState;
+        // from a stale stored state. Same upgrade-to-ReadyForBilling rule as
+        // the dashboard: latest-per-note scrub passed + has unbilled charges.
+        var latestPatientScrubVerdict = patientLatestPerNote.Count == 0
+            ? null
+            : patientLatestPerNote.Values
+                .OrderByDescending(s => s.RanAt)
+                .First()
+                .Verdict;
+        var outstandingCount = _detail.IsConfigured
+            ? (await _detail.GetOutstandingChargesAsync(new[] { id }))
+                .GetValueOrDefault(id)?.Count ?? 0
+            : 0;
+        var state = DeriveDashboardState(
+            insurance, pip, hasNotes, latestPatientScrubVerdict, outstandingCount);
 
         return Ok(new
         {
@@ -569,6 +580,25 @@ public sealed class CasesController : ControllerBase
 
         await _cases.SetPipVerifiedAsync(id, verified);
         return Ok(new { id, patientId = id, pipVerified = true, pipVerifiedAt = verified });
+    }
+
+    // Dashboard/detail state derivation. Starts from the BillingReadiness cascade
+    // (insurance → notes → ReadyForAiScrubbing), then upgrades to ReadyForBilling
+    // when the latest per-note scrub passed AND there are unbilled charges sitting
+    // on the patient. Mirrors the demo framing: "ready for billing for appointment".
+    // Per-appointment state (one per visit, not one per patient) is the proper
+    // fix — tracked separately; this read-time derivation is the bridge.
+    private static string DeriveDashboardState(
+        bool insurance, bool pip, bool notes, string? latestScrubVerdict, int outstandingCount)
+    {
+        var baseState = new BillingReadiness(Insurance: insurance, Pip: pip, Notes: notes).DerivedState;
+        if (baseState == WorkflowStates.ReadyForAiScrubbing
+            && latestScrubVerdict == ScrubVerdicts.Pass
+            && outstandingCount > 0)
+        {
+            return WorkflowStates.ReadyForBilling;
+        }
+        return baseState;
     }
 
     private static (int skip, int take) ParseRange(string? range)
