@@ -13,6 +13,8 @@ import CaseList from './cases/CaseList'
 import CaseShow from './cases/CaseShow'
 import PatientList from './patients/PatientList'
 import ScrubReviewList from './scrub-review/ScrubReviewList'
+import HumanReviewList from './human-review/HumanReviewList'
+import Gavel from '@mui/icons-material/Gavel'
 import DoctorReviewList from './doctor-view/DoctorReviewList'
 import Login from './Login'
 
@@ -46,7 +48,7 @@ const theme = createTheme({
 // Route the .NET Workflow API resources (cases + live PSChiro lookup + scrub
 // review queue) to the workflow data provider; everything else (users, etc.)
 // to NestJS.
-const WORKFLOW_RESOURCES = new Set(['cases', 'patients', 'scrub-review'])
+const WORKFLOW_RESOURCES = new Set(['cases', 'patients', 'scrub-review', 'human-review'])
 const dataProvider = combineDataProviders((resource) =>
   WORKFLOW_RESOURCES.has(resource) ? workflowDataProvider : portalDataProvider,
 )
@@ -78,7 +80,13 @@ export const AppAdmin = () => (
       name="scrub-review"
       list={ScrubReviewList}
       icon={ReportProblem}
-      options={{ label: 'Scrub Review' }}
+      options={{ label: 'Doctor Queue' }}
+    />
+    <Resource
+      name="human-review"
+      list={HumanReviewList}
+      icon={Gavel}
+      options={{ label: 'Human Review' }}
     />
     {/* Doctor's queue. Demo-shortcut: same data as scrub-review, no real role
         scoping yet. The list reuses resource="scrub-review" but adds an

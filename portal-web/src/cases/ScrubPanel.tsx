@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useRefresh } from 'react-admin'
 import {
   Alert,
   Box,
@@ -136,6 +137,10 @@ const ScrubPanel = ({ doctorNoteId, initial = null }: Props) => {
   const [loading, setLoading] = useState(initial == null)
   const [scrubbing, setScrubbing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // After any verdict change (re-scrub or manual override), nudge react-admin
+  // to refetch the case detail — that updates the colored tab dots on every
+  // note (read from record.notes[].latestScrub) so the strip stays in sync.
+  const refresh = useRefresh()
 
   useEffect(() => {
     if (initial !== null) {
@@ -167,6 +172,7 @@ const ScrubPanel = ({ doctorNoteId, initial = null }: Props) => {
         throw new Error(body.error ?? `HTTP ${res.status}`)
       }
       setLatest((await res.json()) as ScrubResult)
+      refresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Scrub failed.')
     } finally {
@@ -212,15 +218,61 @@ const ScrubPanel = ({ doctorNoteId, initial = null }: Props) => {
             </Typography>
           )}
         </Box>
-        <Button
-          size="small"
-          variant="outlined"
-          onClick={runScrub}
-          disabled={scrubbing}
-          startIcon={scrubbing ? <CircularProgress size={14} /> : <AutoAwesome fontSize="small" />}
-        >
-          {scrubbing ? 'Scrubbing…' : latest ? 'Re-scrub note' : 'Scrub note'}
-        </Button>
+        <Box sx={{ display: 'flex', gap: 1 }}>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={runScrub}
+            disabled={scrubbing}
+            startIcon={scrubbing ? <CircularProgress size={14} /> : <AutoAwesome fontSize="small" />}
+          >
+            {scrubbing ? 'Scrubbing…' : latest ? 'Re-scrub note' : 'Scrub note'}
+          </Button>
+          {latest && latest.verdict !== 'pass' && (
+            <Button
+              size="small"
+              variant="outlined"
+              color="success"
+              disabled={scrubbing}
+              onClick={async () => {
+                const reason = window.prompt('Reason for marking this note scrubbed (optional):') ?? ''
+                const r = await fetch(`${WORKFLOW_API}/notes/${doctorNoteId}/override`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ verdict: 'pass', overriddenBy: 'operator', reason }),
+                })
+                if (r.ok) {
+                  setLatest((await r.json()) as ScrubResult)
+                  refresh()
+                }
+              }}
+            >
+              Mark scrubbed
+            </Button>
+          )}
+          {latest && latest.verdict === 'pass' && (
+            <Button
+              size="small"
+              variant="outlined"
+              color="error"
+              disabled={scrubbing}
+              onClick={async () => {
+                const reason = window.prompt('Reason for flagging this note (optional):') ?? ''
+                const r = await fetch(`${WORKFLOW_API}/notes/${doctorNoteId}/override`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ verdict: 'fail', overriddenBy: 'operator', reason }),
+                })
+                if (r.ok) {
+                  setLatest((await r.json()) as ScrubResult)
+                  refresh()
+                }
+              }}
+            >
+              Flag as failed
+            </Button>
+          )}
+        </Box>
       </Box>
 
       {error && (

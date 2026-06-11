@@ -104,7 +104,7 @@ const CaseList = () => (
         render={(r: CaseRecord) => `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim()}
       />
       <BooleanField source="insuranceProvided" label="Insurance" />
-      <BooleanField source="doctorNotesReceived" label="Doctor Notes" />
+      <EstDateTimeField source="lastNoteDate" label="Last note" />
       {/* PIP verified column parked alongside the action button — re-enable together. */}
       {/* <BooleanField source="pipVerified" label="PIP Verified" /> */}
       <FunctionField

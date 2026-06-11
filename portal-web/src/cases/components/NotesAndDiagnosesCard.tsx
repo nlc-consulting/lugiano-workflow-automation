@@ -197,12 +197,27 @@ const NotesAndDiagnosesCard = () => {
                         timeZone: 'America/New_York',
                       })
                     : `Note ${Math.abs(n.id)}`
-                  // Portal-authored corrections get a small badge so reviewers
-                  // can tell them apart from PSChiro chart notes in the strip.
-                  const label =
-                    n.source === 'portal' ? (
-                      <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.75 }}>
-                        <span>{dateStr}</span>
+                  const verdict = n.latestScrub?.verdict
+                  const verdictDot = verdict ? (
+                    <Box
+                      sx={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        bgcolor:
+                          verdict === 'pass'
+                            ? 'success.main'
+                            : verdict === 'fail'
+                            ? 'error.main'
+                            : 'warning.main',
+                      }}
+                    />
+                  ) : null
+                  const label = (
+                    <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.75 }}>
+                      {verdictDot}
+                      <span>{dateStr}</span>
+                      {n.source === 'portal' && (
                         <Chip
                           size="small"
                           color="primary"
@@ -210,10 +225,9 @@ const NotesAndDiagnosesCard = () => {
                           label="Portal"
                           sx={{ height: 18, '& .MuiChip-label': { px: 0.75, fontSize: 10 } }}
                         />
-                      </Box>
-                    ) : (
-                      dateStr
-                    )
+                      )}
+                    </Box>
+                  )
                   return <Tab key={n.id} value={n.id} label={label} />
                 })}
               </Tabs>
