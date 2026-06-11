@@ -18,4 +18,10 @@ public sealed class DoctorNote
     public string? RawRtf { get; set; }
     public string? PlainText { get; set; }
     public DateTime CreatedAt { get; set; }
+    // True when this row was authored as a portal correction (doctor responded
+    // inside our portal). Stays true even after the PSChiro writeback sets
+    // ChartNoteId — used to route the next failing scrub to "Human Review"
+    // instead of back to the "Doctor Queue" (which is for fresh chart-sourced
+    // notes that haven't been doctor-corrected yet).
+    public bool IsPortalAuthored { get; set; }
 }

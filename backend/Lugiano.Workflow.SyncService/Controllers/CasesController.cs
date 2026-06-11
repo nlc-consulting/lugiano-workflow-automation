@@ -87,6 +87,12 @@ public sealed class CasesController : ControllerBase
             .Select(g => new { CaseId = g.Key, Count = g.Count() })
             .ToDictionaryAsync(x => x.CaseId, x => x.Count);
 
+        // Dashboard rollup: just the LATEST per-note scrub for the case (by
+        // RanAt). Matches the reviewer's mental model — "what's the most
+        // recent activity?" — and stays in sync with what they see when they
+        // click in. Failing older notes still surface in Doctor Queue and
+        // Human Review tabs, which filter on per-note latest verdict
+        // independently.
         var scrubByCase = latestByNote
             .GroupBy(s => s.WorkflowCaseId)
             .ToDictionary(
@@ -94,20 +100,9 @@ public sealed class CasesController : ControllerBase
                 g =>
                 {
                     var latest = g.OrderByDescending(s => s.RanAt).First();
-                    var scrubbedNoteCount = g.Count();
-                    var totalNoteCount = notesPerCase.GetValueOrDefault(g.Key, scrubbedNoteCount);
-                    string? rolledVerdict;
-                    if (g.Any(s => s.Verdict == ScrubVerdicts.Fail))
-                        rolledVerdict = ScrubVerdicts.Fail;
-                    else if (g.Any(s => s.Verdict == ScrubVerdicts.NeedsReview))
-                        rolledVerdict = ScrubVerdicts.NeedsReview;
-                    else if (scrubbedNoteCount >= totalNoteCount && g.All(s => s.Verdict == ScrubVerdicts.Pass))
-                        rolledVerdict = ScrubVerdicts.Pass;
-                    else
-                        rolledVerdict = null; // partial coverage, no known issues
                     return new
                     {
-                        Verdict = rolledVerdict,
+                        Verdict = latest.Verdict,
                         RanAt = latest.RanAt,
                     };
                 });
@@ -136,7 +131,8 @@ public sealed class CasesController : ControllerBase
                 LatestScrubAt: scrub?.RanAt,
                 OutstandingChargesCount: outstanding?.Count ?? 0,
                 OutstandingChargesTotal: outstanding?.TotalAmount ?? 0m,
-                OldestOutstandingChargeDate: outstanding?.OldestChargeDate);
+                OldestOutstandingChargeDate: outstanding?.OldestChargeDate,
+                LastNoteDate: c.DoctorNotesReceivedAt);
         }).ToList();
 
         var last = total == 0 ? 0 : Math.Min(skip + rows.Count - 1, total - 1);
@@ -209,14 +205,27 @@ public sealed class CasesController : ControllerBase
         object? ScrubProj(int? doctorNoteId)
         {
             if (doctorNoteId is null || !patientLatestPerNote.TryGetValue(doctorNoteId.Value, out var s)) return null;
+            // Inline the full findings object so the ScrubPanel can render
+            // section breakdowns + issues without a follow-up fetch. Without
+            // this, the panel only had verdict + summary and "the detail"
+            // for failures didn't appear.
             return new
             {
                 id = s.Id,
                 verdict = s.Verdict,
+                overallConfidence = s.OverallConfidence,
                 summary = s.Summary,
                 ranAt = s.RanAt,
+                findings = SafeParse(s.FindingsJson),
+                modelUsed = s.ModelUsed,
+                promptVersion = s.PromptVersion,
             };
         }
+
+        static object? SafeParse(string? json) =>
+            string.IsNullOrWhiteSpace(json)
+                ? null
+                : (object?)JsonSerializer.Deserialize<JsonElement>(json);
 
         // Build the combined notes list with a typed envelope so we can sort
         // chart + portal notes together without reflection.
@@ -654,4 +663,8 @@ public record CaseDto(
     // billing-readiness gate. Count == 0 means "nothing to bill right now".
     int OutstandingChargesCount,
     decimal OutstandingChargesTotal,
-    DateTime? OldestOutstandingChargeDate);
+    DateTime? OldestOutstandingChargeDate,
+    // Most recent chart note's date — what the reviewer sees as "last touched
+    // clinically". Currently mirrors DoctorNotesReceivedAt (= max NoteDate
+    // we've stamped). Always show the most recent one in the main table.
+    DateTime? LastNoteDate);

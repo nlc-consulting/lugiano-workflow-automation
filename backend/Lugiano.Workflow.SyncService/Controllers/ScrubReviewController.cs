@@ -31,8 +31,12 @@ public sealed class ScrubReviewController : ControllerBase
         // latest scrub. Roll up to the case: if ANY note's latest is Fail,
         // the case is in the review queue. ScrubResult is append-only and
         // small in practice — pull a thin projection, reduce in memory.
+        // Scrub Review = chart-sourced notes that failed (doctor hasn't been
+        // given a chance to correct yet). Portal-authored failures are routed
+        // to Human Review instead — see HumanReviewController.
         var allScrubs = await db.ScrubResults.AsNoTracking()
-            .Where(s => s.DoctorNoteId != null)
+            .Where(s => s.DoctorNoteId != null
+                        && db.DoctorNotes.Any(n => n.Id == s.DoctorNoteId && !n.IsPortalAuthored))
             .Select(s => new
             {
                 s.WorkflowCaseId,

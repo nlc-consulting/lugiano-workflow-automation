@@ -148,6 +148,9 @@ namespace Lugiano.Workflow.SyncService.Migrations
                     b.Property<int?>("DoctorId")
                         .HasColumnType("int");
 
+                    b.Property<bool>("IsPortalAuthored")
+                        .HasColumnType("bit");
+
                     b.Property<DateTime?>("NoteDate")
                         .HasColumnType("datetime2");
 

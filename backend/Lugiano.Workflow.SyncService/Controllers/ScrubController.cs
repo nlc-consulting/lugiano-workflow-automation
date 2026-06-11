@@ -37,6 +37,34 @@ public sealed class ScrubController : ControllerBase
         return Ok(Project(result));
     }
 
+    // POST /notes/{doctorNoteId}/override — manually flip this note's verdict.
+    // Used by reviewers / admins to mark a note 'good' or send it back to 'bad'
+    // without re-running Claude. Writes a fresh ScrubResult so the latest-wins
+    // rollup picks it up immediately.
+    [HttpPost("notes/{doctorNoteId:int}/override")]
+    public async Task<IActionResult> Override(
+        int doctorNoteId,
+        [FromBody] OverrideRequest req,
+        [FromServices] Services.WorkflowCaseService cases,
+        CancellationToken ct)
+    {
+        if (req?.Verdict is not ("pass" or "fail" or "needs_review"))
+            return BadRequest(new { error = "Verdict must be 'pass', 'fail', or 'needs_review'." });
+
+        try
+        {
+            var result = await cases.OverrideScrubVerdictAsync(
+                doctorNoteId, req.Verdict, req.OverriddenBy, req.Reason);
+            return Ok(Project(result));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
+    }
+
+    public sealed record OverrideRequest(string Verdict, string? OverriddenBy, string? Reason);
+
     private static object Project(Lugiano.Workflow.SyncService.Workflow.Models.ScrubResult r) => new
     {
         id = r.Id,

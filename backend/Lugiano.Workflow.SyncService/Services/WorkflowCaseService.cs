@@ -196,9 +196,56 @@ public sealed class WorkflowCaseService
             RawRtf = null,
             PlainText = text,
             CreatedAt = DateTime.UtcNow,
+            // Sticky marker — stays true even after the PSChiro writeback sets
+            // ChartNoteId. Routes future failing scrubs to Human Review.
+            IsPortalAuthored = true,
         };
         db.DoctorNotes.Add(note);
         await db.SaveChangesAsync();
         return note.Id;
+    }
+
+    // Manual scrub override — writes a new ScrubResult with the chosen verdict
+    // and a marker in FindingsJson noting it was a human override. Latest
+    // wins on the rollup, so this flips a failing note to passing (or vice
+    // versa) without re-running Claude.
+    public async Task<ScrubResult> OverrideScrubVerdictAsync(
+        int doctorNoteId, string newVerdict, string? overriddenBy, string? reason)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        var note = await db.DoctorNotes.AsNoTracking()
+            .FirstOrDefaultAsync(n => n.Id == doctorNoteId)
+            ?? throw new InvalidOperationException($"DoctorNote {doctorNoteId} not found.");
+
+        var findings = new
+        {
+            verdict = newVerdict,
+            overall_confidence = 100,
+            summary = $"Manual override by {overriddenBy ?? "operator"}: {reason ?? "no reason given"}.",
+            sections = new { },
+            diagnosis_alignment = new { score = 100, issues = Array.Empty<object>() },
+            charge_alignment = new { score = 100, issues = Array.Empty<object>() },
+            issues = Array.Empty<object>(),
+            manual_override = true,
+            overridden_by = overriddenBy,
+            reason,
+        };
+
+        var result = new ScrubResult
+        {
+            DoctorNoteId = note.Id,
+            WorkflowCaseId = note.WorkflowCaseId,
+            Verdict = newVerdict,
+            OverallConfidence = 100,
+            Summary = $"Manual override: {reason ?? "no reason given"}",
+            FindingsJson = System.Text.Json.JsonSerializer.Serialize(findings),
+            RawResponseJson = null,
+            ModelUsed = "manual-override",
+            PromptVersion = "manual",
+            RanAt = DateTime.UtcNow,
+        };
+        db.ScrubResults.Add(result);
+        await db.SaveChangesAsync();
+        return result;
     }
 }

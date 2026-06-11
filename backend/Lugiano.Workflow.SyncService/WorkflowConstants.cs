@@ -9,6 +9,11 @@ public static class WorkflowStates
     // Note has been sent back to the doctor; resumes the cascade when a
     // corrected ChartNote arrives via sync.
     public const string AwaitingDoctorCorrection = "AwaitingDoctorCorrection";
+    // Latest note passed scrub and there are unbilled charges sitting on the
+    // patient's chart — the bill is queued for the next batch event. Derived
+    // at read-time in CasesController.GetCases (not stored on WorkflowCase)
+    // until we refactor state to per-appointment.
+    public const string ReadyForBilling = "ReadyForBilling";
 }
 
 // Lifecycle of a single CorrectionRequest. Pending = created but not yet
