@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Lugiano.Workflow.SyncService.ChiroTouch;
 using Lugiano.Workflow.SyncService.ChiroTouch.Models;
+using Lugiano.Workflow.SyncService.Services.Scrubbing;
 using Lugiano.Workflow.SyncService.Workflow.Models;
 using Lugiano.Workflow.SyncService.Util;
 using Microsoft.Extensions.Logging;
@@ -16,6 +17,7 @@ public sealed class ChartNoteSyncService
     private readonly WorkflowCaseService _cases;
     private readonly SyncStateService _syncState;
     private readonly CorrectionRequestService _corrections;
+    private readonly ScrubOrchestrator _scrubs;
     private readonly ILogger<ChartNoteSyncService> _logger;
 
     public ChartNoteSyncService(
@@ -24,6 +26,7 @@ public sealed class ChartNoteSyncService
         WorkflowCaseService cases,
         SyncStateService syncState,
         CorrectionRequestService corrections,
+        ScrubOrchestrator scrubs,
         ILogger<ChartNoteSyncService> logger)
     {
         _reads = reads;
@@ -31,6 +34,7 @@ public sealed class ChartNoteSyncService
         _cases = cases;
         _syncState = syncState;
         _corrections = corrections;
+        _scrubs = scrubs;
         _logger = logger;
     }
 
@@ -116,6 +120,35 @@ public sealed class ChartNoteSyncService
                 // arriving is the doctor's response (whether it's a fresh chart
                 // entry or a corrected one).
                 await _corrections.ResolveOpenForPatientAsync(note.PatientId, ct);
+
+                // Auto-scrub policy: when a new chart note arrives, scrub
+                // THAT specific note against its visit's DX + charges.
+                // Gate to avoid wasted runs: skip if the patient's last scrub
+                // was a Pass (chart already clean) — fail/no-prior triggers
+                // the scrub. Scrub errors are logged but never break the sync
+                // cycle — sync's job is to capture state.
+                if (await _scrubs.ShouldAutoScrubAsync(caseId, ct))
+                {
+                    try
+                    {
+                        // Find the DoctorNote.Id we just stored for this
+                        // ChartNotes row.
+                        var doctorNoteId = await _cases.GetDoctorNoteIdByChartNoteIdAsync(note.Id);
+                        if (doctorNoteId.HasValue)
+                        {
+                            var result = await _scrubs.RunForNoteAsync(doctorNoteId.Value, ct);
+                            _logger.LogInformation(
+                                "ChartNotes: auto-scrubbed note {NoteId} (case {CaseId}, patient {PatientId}) -> {Verdict}.",
+                                doctorNoteId.Value, caseId, note.PatientId, result.Verdict);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "ChartNotes: auto-scrub failed for note {NoteId} (case {CaseId}); continuing sync.",
+                            note.Id, caseId);
+                    }
+                }
 
                 if (note.Id > maxProcessedId)
                     maxProcessedId = note.Id;

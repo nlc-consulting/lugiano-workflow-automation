@@ -2,8 +2,10 @@ using System.Globalization;
 using System.Text.Json;
 using Lugiano.Workflow.SyncService.ChiroTouch;
 using Lugiano.Workflow.SyncService.Services;
+using Lugiano.Workflow.SyncService.Services.Scrubbing;
 using Lugiano.Workflow.SyncService.Util;
 using Lugiano.Workflow.SyncService.Workflow;
+using Lugiano.Workflow.SyncService.Workflow.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -17,17 +19,29 @@ public sealed class CasesController : ControllerBase
     private readonly IPatientDetailQueries _detail;
     private readonly IChartNoteReadQueries _noteReads;
     private readonly WorkflowCaseService _cases;
+    private readonly ScrubOrchestrator _scrubs;
+    private readonly CorrectionRequestService _corrections;
+    private readonly IPSChiroWriteService _pschiroWrite;
+    private readonly ILogger<CasesController> _logger;
 
     public CasesController(
         IDbContextFactory<WorkflowDbContext> factory,
         IPatientDetailQueries detail,
         IChartNoteReadQueries noteReads,
-        WorkflowCaseService cases)
+        WorkflowCaseService cases,
+        ScrubOrchestrator scrubs,
+        CorrectionRequestService corrections,
+        IPSChiroWriteService pschiroWrite,
+        ILogger<CasesController> logger)
     {
         _factory = factory;
         _detail = detail;
         _noteReads = noteReads;
         _cases = cases;
+        _scrubs = scrubs;
+        _corrections = corrections;
+        _pschiroWrite = pschiroWrite;
+        _logger = logger;
     }
 
     // GET /cases — dashboard: the portal's workflow record, newest-first, with per-flow stamps.
@@ -46,17 +60,83 @@ public sealed class CasesController : ControllerBase
             .Skip(skip).Take(take)
             .ToListAsync();
 
+        var caseIds = cases.Select(c => c.Id).ToList();
+        var patientIds = cases.Select(c => c.PatientId).ToList();
+
+        // Per-note scrubs aggregated to a case-level chip. For each case:
+        // take each note's LATEST scrub, then roll up:
+        //   any fail        -> case = fail
+        //   else needs_review -> case = needs_review
+        //   else (all pass and every note scrubbed) -> case = pass
+        //   else (some notes unscrubbed and no known issues) -> null (partial)
+        // The full per-note breakdown lives on the case detail.
+        var perNoteScrubs = await db.ScrubResults.AsNoTracking()
+            .Where(s => s.DoctorNoteId != null && caseIds.Contains(s.WorkflowCaseId))
+            .Select(s => new { s.WorkflowCaseId, NoteId = s.DoctorNoteId!.Value, s.Verdict, s.RanAt })
+            .ToListAsync();
+
+        // Distinct notes with at least one scrub.
+        var latestByNote = perNoteScrubs
+            .GroupBy(s => new { s.WorkflowCaseId, s.NoteId })
+            .Select(g => g.OrderByDescending(s => s.RanAt).First())
+            .ToList();
+
+        var notesPerCase = await db.DoctorNotes.AsNoTracking()
+            .Where(n => caseIds.Contains(n.WorkflowCaseId))
+            .GroupBy(n => n.WorkflowCaseId)
+            .Select(g => new { CaseId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.CaseId, x => x.Count);
+
+        var scrubByCase = latestByNote
+            .GroupBy(s => s.WorkflowCaseId)
+            .ToDictionary(
+                g => g.Key,
+                g =>
+                {
+                    var latest = g.OrderByDescending(s => s.RanAt).First();
+                    var scrubbedNoteCount = g.Count();
+                    var totalNoteCount = notesPerCase.GetValueOrDefault(g.Key, scrubbedNoteCount);
+                    string? rolledVerdict;
+                    if (g.Any(s => s.Verdict == ScrubVerdicts.Fail))
+                        rolledVerdict = ScrubVerdicts.Fail;
+                    else if (g.Any(s => s.Verdict == ScrubVerdicts.NeedsReview))
+                        rolledVerdict = ScrubVerdicts.NeedsReview;
+                    else if (scrubbedNoteCount >= totalNoteCount && g.All(s => s.Verdict == ScrubVerdicts.Pass))
+                        rolledVerdict = ScrubVerdicts.Pass;
+                    else
+                        rolledVerdict = null; // partial coverage, no known issues
+                    return new
+                    {
+                        Verdict = rolledVerdict,
+                        RanAt = latest.RanAt,
+                    };
+                });
+
+        // Outstanding charges (third billing-readiness gate). Unbilled service
+        // charges per patient. Patients not in the dict have nothing pending.
+        var outstandingByPatient = _detail.IsConfigured
+            ? await _detail.GetOutstandingChargesAsync(patientIds)
+            : new Dictionary<int, OutstandingChargesSummary>();
+
         var rows = cases.Select(c =>
         {
             var insurance = c.InsuranceAddedAt != null;
             var notes = c.DoctorNotesReceivedAt != null;
             var pip = c.PipVerifiedAt != null;
+            var scrub = scrubByCase.GetValueOrDefault(c.Id);
+            outstandingByPatient.TryGetValue(c.PatientId, out var outstanding);
+
             return new CaseDto(
                 c.PatientId, c.PatientId, c.FirstName, c.LastName,
                 new BillingReadiness(Insurance: insurance, Pip: pip, Notes: notes).DerivedState,
                 insurance, notes, pip,
                 c.InsuranceAddedAt, c.DoctorNotesReceivedAt, c.PipVerifiedAt,
-                c.CreatedAt, c.UpdatedAt);
+                c.CreatedAt, c.UpdatedAt,
+                LatestScrubVerdict: scrub?.Verdict,
+                LatestScrubAt: scrub?.RanAt,
+                OutstandingChargesCount: outstanding?.Count ?? 0,
+                OutstandingChargesTotal: outstanding?.TotalAmount ?? 0m,
+                OldestOutstandingChargeDate: outstanding?.OldestChargeDate);
         }).ToList();
 
         var last = total == 0 ? 0 : Math.Min(skip + rows.Count - 1, total - 1);
@@ -74,30 +154,94 @@ public sealed class CasesController : ControllerBase
         if (demo is null) return NotFound();
 
         var policies = await _detail.GetPoliciesAsync(id);
-        var noteRows = await _detail.GetRecentNotesAsync(id, 5);
+        // Pull up to 50 notes — patient history is sometimes deep and the tab UI
+        // scrolls horizontally so the cost is mostly in the SQL roundtrip.
+        var noteRows = await _detail.GetRecentNotesAsync(id, 50);
         // Charges for the visits the recent notes matched into — mirrors how
         // ChiroTouch shows the bill alongside the notes the reviewer is reading.
         var matchedVisitIds = noteRows
             .Where(n => n.VisitId.HasValue)
-            .Select(n => n.VisitId!.Value);
+            .Select(n => n.VisitId!.Value)
+            .ToList();
         var chargeRows = await _detail.GetChargesForVisitsAsync(matchedVisitIds);
 
-        var notes = new List<object>();
-        var textBudget = 3;
+        // Diagnoses, scoped per visit. ChiroTouch's chart-note DX panel shows the
+        // diagnosis set for that note's appointment (in Seq order), not the
+        // patient's whole history — so group by appointment and attach each set to
+        // its note rather than emitting a single patient-wide list.
+        var diagnosesByVisit = (await _detail.GetDiagnosesForVisitsAsync(matchedVisitIds))
+            .GroupBy(d => d.AppointmentId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(d => (object)new { code = d.Code, description = d.Description }).ToList());
+
+        // Pull cached PlainText from our DoctorNote table in a single query so
+        // every note (not just the first 3) can display its body. Worker
+        // reconstructs and stores PlainText on sync, so this is the fast path.
+        // ChartNoteId is nullable on DoctorNote (portal-authored corrections
+        // have null), so filter those out of this lookup — they're surfaced
+        // separately below.
+        var chartNoteIds = noteRows.Select(n => n.Id).ToArray();
+        await using var noteDb = await _factory.CreateDbContextAsync();
+        // Pull both PlainText AND our internal DoctorNote.Id keyed by ChartNoteId
+        // so each note tab can carry its own latestScrub.
+        var doctorNoteByChartId = await noteDb.DoctorNotes
+            .AsNoTracking()
+            .Where(n => n.ChartNoteId.HasValue && chartNoteIds.Contains(n.ChartNoteId.Value))
+            .Select(n => new { ChartNoteId = n.ChartNoteId!.Value, n.Id, n.PlainText })
+            .ToDictionaryAsync(n => n.ChartNoteId, n => new { n.Id, n.PlainText });
+
+        // Build a doctorNoteId -> latest ScrubResult dictionary for the whole
+        // patient so the per-tab ScrubPanel can render without a follow-up
+        // fetch. Same dictionary feeds the case-level rollup below.
+        var patientLatestPerNote = new Dictionary<int, ScrubResult>();
+        var allPatientScrubs = await noteDb.ScrubResults.AsNoTracking()
+            .Where(s => s.DoctorNoteId != null
+                        && noteDb.DoctorNotes.Any(n => n.Id == s.DoctorNoteId && n.PatientId == id))
+            .OrderByDescending(s => s.RanAt)
+            .ToListAsync();
+        foreach (var s in allPatientScrubs)
+        {
+            if (!patientLatestPerNote.ContainsKey(s.DoctorNoteId!.Value))
+                patientLatestPerNote[s.DoctorNoteId.Value] = s;
+        }
+
+        object? ScrubProj(int? doctorNoteId)
+        {
+            if (doctorNoteId is null || !patientLatestPerNote.TryGetValue(doctorNoteId.Value, out var s)) return null;
+            return new
+            {
+                id = s.Id,
+                verdict = s.Verdict,
+                summary = s.Summary,
+                ranAt = s.RanAt,
+            };
+        }
+
+        // Build the combined notes list with a typed envelope so we can sort
+        // chart + portal notes together without reflection.
+        var noteCards = new List<NoteCard>();
+
         foreach (var n in noteRows)
         {
-            string? text = null;
-            if (textBudget-- > 0 && n.SoapPtr is int ptr and not 0)
+            var cached = doctorNoteByChartId.GetValueOrDefault(n.Id);
+            string? text = cached?.PlainText;
+            int? doctorNoteId = cached?.Id;
+            // Live fallback for notes we haven't cached yet (existing patients
+            // whose history pre-dates the sync). Slow but bounded per page;
+            // task #43's historical backfill makes this path rare.
+            if (text is null && n.SoapPtr is int ptr and not 0)
             {
-                // One bad note's RTF must not 500 the whole detail view.
                 try { text = RtfConverter.ToPlainText(await _noteReads.GetNoteRtfAsync(ptr)); }
                 catch { text = null; }
             }
             var (matchScore, matchReasons) = ScoreVisitMatch(n);
 
-            notes.Add(new
+            noteCards.Add(new NoteCard(n.NoteDate, new
             {
                 id = n.Id,
+                source = "chart",
+                doctorNoteId,
                 noteDate = n.NoteDate,
                 doctor = n.Doctor,
                 status = n.Status,
@@ -110,15 +254,81 @@ public sealed class CasesController : ControllerBase
                 visitsSameDay = n.VisitsSameDay,
                 matchScore,
                 matchReasons,
-            });
+                diagnoses = n.VisitId is int vid && diagnosesByVisit.TryGetValue(vid, out var dx)
+                    ? dx
+                    : new List<object>(),
+                // Per-tab ScrubPanel reads this inline — no follow-up fetch.
+                latestScrub = ScrubProj(doctorNoteId),
+            }));
         }
 
-        // Diagnoses live in dbo.Diagnoses keyed by AppointmentID (PatientID
-        // column on those rows is typically NULL). Join through Appointments
-        // gets the patient's full active diagnosis set with descriptions already
-        // populated — no catalog lookup needed.
-        var diagnoses = (await _detail.GetPatientDiagnosesAsync(id))
-            .Select(d => new { code = d.Code, description = d.Description })
+        // Portal-authored corrections (no PSChiro ChartNote). Doctor authored
+        // these inside our portal in response to a failed scrub; they belong
+        // alongside the chart notes in the tabs so the reviewer sees the full
+        // history. Each carries its latest scrub inline so the tab renders
+        // without a follow-up fetch — there's no ChartNoteId for the existing
+        // scrub endpoint to key off of.
+        var portalNotes = await noteDb.DoctorNotes
+            .AsNoTracking()
+            .Where(n => n.PatientId == id && n.ChartNoteId == null)
+            .OrderByDescending(n => n.NoteDate)
+            .Select(n => new
+            {
+                n.Id,
+                n.DoctorId,
+                n.NoteDate,
+                n.PlainText,
+                n.CreatedAt,
+            })
+            .ToListAsync();
+
+        if (portalNotes.Count > 0)
+        {
+            // DoctorId on DoctorNote is the ChiroTouch ID; map through Doctor.ChiroTouchDoctorId.
+            var portalDoctorIds = portalNotes.Where(p => p.DoctorId.HasValue)
+                .Select(p => p.DoctorId!.Value).Distinct().ToList();
+            var doctorNamesByCtId = portalDoctorIds.Count == 0
+                ? new Dictionary<int, string>()
+                : await noteDb.Doctors.AsNoTracking()
+                    .Where(d => portalDoctorIds.Contains(d.ChiroTouchDoctorId))
+                    .ToDictionaryAsync(d => d.ChiroTouchDoctorId, d => d.FullName ?? string.Empty);
+
+            foreach (var p in portalNotes)
+            {
+                noteCards.Add(new NoteCard(p.NoteDate, new
+                {
+                    // Negative id keeps tab keys unique against chart-note IDs
+                    // (positive ints from PSChiro). The frontend doesn't read
+                    // the value beyond uniqueness.
+                    id = -p.Id,
+                    source = "portal",
+                    portalNoteId = p.Id,
+                    noteDate = p.NoteDate,
+                    doctor = p.DoctorId.HasValue && doctorNamesByCtId.TryGetValue(p.DoctorId.Value, out var name)
+                        ? name
+                        : "Portal correction",
+                    status = (int?)null,
+                    plainText = p.PlainText,
+                    visitId = (int?)null,
+                    visitTime = (DateTime?)null,
+                    visitCheckIn = (DateTime?)null,
+                    visitCheckOut = (DateTime?)null,
+                    visitDoctor = (string?)null,
+                    visitsSameDay = 0,
+                    matchScore = (int?)null,
+                    matchReasons = new List<string>(),
+                    diagnoses = new List<object>(),
+                    createdAt = p.CreatedAt,
+                    doctorNoteId = (int?)p.Id,
+                    latestScrub = ScrubProj(p.Id),
+                }));
+            }
+        }
+
+        // Merge chart + portal notes into one tab strip, newest first.
+        var notes = noteCards
+            .OrderByDescending(c => c.NoteDate ?? DateTime.MinValue)
+            .Select(c => c.Payload)
             .ToList();
 
         await using var db = await _factory.CreateDbContextAsync();
@@ -126,10 +336,35 @@ public sealed class CasesController : ControllerBase
             .Where(c => c.PatientId == id)
             .Select(c => new
             {
+                c.Id,
                 c.CurrentState, c.InsuranceAddedAt, c.DoctorNotesReceivedAt, c.PipVerifiedAt,
                 c.CreatedAt, c.UpdatedAt,
             })
             .FirstOrDefaultAsync();
+
+        // Case rollup from the per-note dictionary built earlier
+        // (patientLatestPerNote). CaseScrubCard renders this; per-tab
+        // ScrubPanel reads each note's own latestScrub directly.
+        object? caseScrubSummary = null;
+        if (patientLatestPerNote.Count > 0)
+        {
+            int passCount = patientLatestPerNote.Values.Count(s => s.Verdict == ScrubVerdicts.Pass);
+            int needsReviewCount = patientLatestPerNote.Values.Count(s => s.Verdict == ScrubVerdicts.NeedsReview);
+            int failCount = patientLatestPerNote.Values.Count(s => s.Verdict == ScrubVerdicts.Fail);
+            string? rolled =
+                failCount > 0 ? ScrubVerdicts.Fail :
+                needsReviewCount > 0 ? ScrubVerdicts.NeedsReview :
+                ScrubVerdicts.Pass;
+            caseScrubSummary = new
+            {
+                rolledVerdict = rolled,
+                passCount,
+                needsReviewCount,
+                failCount,
+                scrubbedNoteCount = patientLatestPerNote.Count,
+                latestRanAt = patientLatestPerNote.Values.Max(s => s.RanAt),
+            };
+        }
 
         var insurance = policies.Count > 0;
         var hasNotes = noteRows.Count > 0;
@@ -152,6 +387,8 @@ public sealed class CasesController : ControllerBase
             state = demo.State,
             zip = demo.Zip,
             primaryDoctor = demo.PrimaryDoctor,
+            caseType = demo.CaseType,
+            curInjuryDate = demo.CurInjuryDate,
             currentState = state,
             insuranceProvided = insurance,
             doctorNotesReceived = hasNotes,
@@ -163,6 +400,7 @@ public sealed class CasesController : ControllerBase
             pipVerifiedAt = wc?.PipVerifiedAt,
             addedAt = wc?.CreatedAt,
             lastUpdatedAt = wc?.UpdatedAt,
+            caseScrubSummary,
             policies = policies.Select(p => new
             {
                 id = p.Id,
@@ -183,8 +421,94 @@ public sealed class CasesController : ControllerBase
                 modifier2 = c.Modifier2,
                 diagnoses = c.Diagnoses,
             }),
-            diagnoses,
             notes,
+        });
+    }
+
+    // POST /cases/{id}/doctor-notes — doctor authors a correction note in the
+    // portal (no ChiroTouch ChartNote). id == PatientId. Persists to our DB,
+    // auto-resolves open kickbacks for the patient, and re-scrubs immediately
+    // so the doctor sees the new verdict before leaving the page.
+    [HttpPost("{id:int}/doctor-notes")]
+    public async Task<IActionResult> AuthorCorrectedNote(
+        int id,
+        [FromBody] AuthorCorrectedNoteRequest req,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(req?.Text))
+            return BadRequest(new { error = "Note text is required." });
+
+        await using var db = await _factory.CreateDbContextAsync(ct);
+        var wc = await db.WorkflowCases.FirstOrDefaultAsync(c => c.PatientId == id, ct);
+        if (wc is null) return NotFound(new { error = $"No workflow case for patient {id}." });
+
+        // Look up the original failing note (when the modal provides it) so
+        // the PSChiro writeback can reuse its date + doctor. ChiroTouch's UI
+        // is appointment-anchored, so a correction must land on the same DOS
+        // as the original note's visit to appear in the chart.
+        DoctorNote? original = req.OriginalDoctorNoteId.HasValue
+            ? await _cases.GetDoctorNoteByIdAsync(req.OriginalDoctorNoteId.Value)
+            : null;
+
+        // Doctor attribution: the correction is recorded as the ORIGINAL
+        // note's doctor (we're correcting their work in their name). Falls
+        // back to req.DoctorId, then to "no doctor" for portal-only cases.
+        var attributedDoctorId = original?.DoctorId ?? req.DoctorId;
+        var attributedNoteDate = original?.NoteDate ?? req.NoteDate;
+
+        var doctorNoteId = await _cases.InsertPortalAuthoredNoteAsync(
+            workflowCaseId: wc.Id,
+            patientId: id,
+            doctorId: attributedDoctorId,
+            text: req.Text.Trim(),
+            noteDate: attributedNoteDate);
+
+        // PSChiro writeback (Phase 2). When the write account is configured
+        // and we have a doctor + date to anchor to, push the correction into
+        // ChartNotes so it appears in ChiroTouch alongside the original. Best
+        // effort — failures here log but don't fail the response (our portal
+        // DB still has the correction, and re-scrub still fires).
+        int? writebackChartNoteId = null;
+        if (_pschiroWrite.IsConfigured
+            && attributedDoctorId.HasValue
+            && attributedNoteDate.HasValue)
+        {
+            try
+            {
+                var writeResult = await _pschiroWrite.WriteCorrectionChartNoteAsync(
+                    patientId: id,
+                    doctorId: attributedDoctorId.Value,
+                    noteDate: attributedNoteDate.Value,
+                    plainText: req.Text.Trim(),
+                    ct: ct);
+                await _cases.LinkPortalNoteToChartNoteAsync(doctorNoteId, writeResult.ChartNoteId);
+                writebackChartNoteId = writeResult.ChartNoteId;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "PSChiro writeback failed for portal note {DoctorNoteId} (patient {PatientId}); correction is in our DB but not yet in ChiroTouch.",
+                    doctorNoteId, id);
+            }
+        }
+
+        // Open kickbacks resolved — the doctor just responded, regardless of
+        // whether the next scrub passes or fails (it might still fail, in
+        // which case a new kickback gets created downstream).
+        await _corrections.ResolveOpenForPatientAsync(id, ct);
+
+        // Per-note scrub on the newly authored portal correction. Each note
+        // is its own billable unit, so we evaluate this one against its own
+        // (empty for portal-authored) visit DX + charges.
+        var scrub = await _scrubs.RunForNoteAsync(doctorNoteId, ct);
+        return Ok(new
+        {
+            doctorNoteId,
+            chartNoteId = writebackChartNoteId,
+            scrubId = scrub.Id,
+            verdict = scrub.Verdict,
+            summary = scrub.Summary,
+            ranAt = scrub.RanAt,
         });
     }
 
@@ -258,6 +582,21 @@ public sealed class CasesController : ControllerBase
     }
 }
 
+// Doctor-authored correction note from the portal. OriginalDoctorNoteId, when
+// provided, anchors the correction to a specific failing note — its date and
+// doctor are reused for the PSChiro writeback so the correction lands on the
+// same visit (ChiroTouch's UI is appointment-anchored).
+public record AuthorCorrectedNoteRequest(
+    int? DoctorId,
+    string Text,
+    DateTime? NoteDate,
+    int? OriginalDoctorNoteId);
+
+// Internal envelope used by GetCase to interleave chart notes and portal-authored
+// corrections by date before serializing. Payload is the per-note anonymous object
+// the frontend consumes.
+internal sealed record NoteCard(DateTime? NoteDate, object Payload);
+
 // Dashboard row (serialized to camelCase; id == PatientId).
 public record CaseDto(
     int Id,
@@ -272,4 +611,13 @@ public record CaseDto(
     DateTime? DoctorNotesReceivedAt,
     DateTime? PipVerifiedAt,
     DateTime AddedAt,
-    DateTime LastUpdatedAt);
+    DateTime LastUpdatedAt,
+    // Case-level scrub verdict. Null when no case scrub has run yet so the
+    // dashboard can render "Not scrubbed" distinctly from a verdict.
+    string? LatestScrubVerdict,
+    DateTime? LatestScrubAt,
+    // Outstanding (unbilled) service charges for the patient — the third
+    // billing-readiness gate. Count == 0 means "nothing to bill right now".
+    int OutstandingChargesCount,
+    decimal OutstandingChargesTotal,
+    DateTime? OldestOutstandingChargeDate);

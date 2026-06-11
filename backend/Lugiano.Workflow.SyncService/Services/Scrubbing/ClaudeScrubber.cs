@@ -93,47 +93,61 @@ public sealed class ClaudeScrubber : IScrubber
     private static string BuildUserPrompt(ScrubContext ctx)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("=== NOTE TO SCRUB ===");
+
+        sb.AppendLine("=== NOTE BEING SCRUBBED ===");
         sb.Append("Date of service: ");
-        sb.AppendLine(ctx.NoteDate?.ToString("yyyy-MM-dd") ?? "unknown");
-        sb.AppendLine();
-        sb.AppendLine(string.IsNullOrWhiteSpace(ctx.NoteText) ? "(note text unavailable)" : ctx.NoteText);
-        sb.AppendLine();
-
-        sb.AppendLine("=== CHARGES BILLED ON THIS VISIT ===");
-        if (ctx.VisitCharges.Count == 0)
+        sb.AppendLine(ctx.FocalNoteDate?.ToString("yyyy-MM-dd") ?? "unknown");
+        if (!string.IsNullOrWhiteSpace(ctx.FocalNoteDoctor))
         {
-            sb.AppendLine("(no charges entered for this visit)");
-        }
-        else
-        {
-            foreach (var c in ctx.VisitCharges)
-            {
-                sb.Append($"- {c.Code} {c.Description ?? string.Empty} ${c.Amount:F2}");
-                if (!string.IsNullOrWhiteSpace(c.Diagnoses))
-                    sb.Append($"  | linked Dx: {c.Diagnoses}");
-                sb.AppendLine();
-            }
+            sb.Append("Provider: ");
+            sb.AppendLine(ctx.FocalNoteDoctor);
         }
         sb.AppendLine();
+        sb.AppendLine(string.IsNullOrWhiteSpace(ctx.FocalNoteText) ? "(note text unavailable)" : ctx.FocalNoteText);
+        sb.AppendLine();
 
-        sb.AppendLine("=== PATIENT'S DOCUMENTED DIAGNOSES ===");
-        if (ctx.PatientDiagnoses.Count == 0)
-            sb.AppendLine("(none extracted from notes)");
+        sb.AppendLine("=== DIAGNOSES ON THE BILL FOR THIS NOTE'S VISIT ===");
+        if (ctx.ItsVisitDiagnoses.Count == 0)
+            sb.AppendLine("(no diagnoses entered on this visit's appointment)");
         else
-            foreach (var d in ctx.PatientDiagnoses)
+            foreach (var d in ctx.ItsVisitDiagnoses)
                 sb.AppendLine($"- {d}");
         sb.AppendLine();
 
+        sb.AppendLine("=== CHARGES BILLED ON THIS NOTE'S VISIT ===");
+        if (ctx.ItsVisitCharges.Count == 0)
+            sb.AppendLine("(no charges entered for this visit yet)");
+        else
+            foreach (var c in ctx.ItsVisitCharges)
+                sb.AppendLine($"- {c.Code} {c.Description ?? string.Empty} ${c.Amount:F2}");
+        sb.AppendLine();
+
+        if (ctx.ClonedFromPrior)
+        {
+            sb.AppendLine("=== CLONED-NOTE PATTERN DETECTED ===");
+            sb.AppendLine("This note's text is >=95% byte-identical to one of the patient's recent prior notes (the practice's 'carry forward previous visit' templating habit). Surface this as a `cloned_documentation` issue (severity: medium) so the biller can confirm documentation freshness before submission — PIP carriers actively flag cloned-notes patterns in audits.");
+            sb.AppendLine();
+        }
+
         if (ctx.OtherNotes.Count > 0)
         {
-            sb.AppendLine($"=== PATIENT'S OTHER NOTES ({ctx.OtherNotes.Count}, for holistic review) ===");
-            foreach (var p in ctx.OtherNotes)
+            sb.AppendLine($"=== BRIEF CHART CONTEXT ({ctx.OtherNotes.Count} prior notes, truncated) ===");
+            sb.AppendLine("Background only — do NOT evaluate these for completeness; they are here so you can see prior treatment continuity.");
+            sb.AppendLine();
+            int i = 1;
+            foreach (var n in ctx.OtherNotes)
             {
+                sb.AppendLine($"--- Prior {i} of {ctx.OtherNotes.Count} ---");
                 sb.Append("Date: ");
-                sb.AppendLine(p.NoteDate?.ToString("yyyy-MM-dd") ?? "unknown");
-                sb.AppendLine(p.Text);
-                sb.AppendLine("---");
+                sb.AppendLine(n.NoteDate?.ToString("yyyy-MM-dd") ?? "unknown");
+                if (!string.IsNullOrWhiteSpace(n.Doctor))
+                {
+                    sb.Append("Provider: ");
+                    sb.AppendLine(n.Doctor);
+                }
+                sb.AppendLine(n.Text);
+                sb.AppendLine();
+                i++;
             }
         }
 
