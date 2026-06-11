@@ -58,9 +58,37 @@ public sealed class PSChiroWriteService : IPSChiroWriteService
         // notes is template-generated but not required by the parser).
         // Cap at 4000 chars for safety (varchar(4096) field).
         var rtfBody = BuildRtf(plainText);
+        // Normalize to midnight. ChiroTouch's UI is date-anchored; real notes
+        // store NoteDate as midnight, so any time component on the input
+        // would diverge from the proven pattern.
+        var anchoredDate = noteDate.Date;
 
         await using var conn = _writeDb.Create();
         await conn.OpenAsync(ct);
+
+        // Pre-fetch the doctor's stored signature image OUTSIDE the
+        // transaction. If the doctor has never signed before, the writeback
+        // would otherwise silently insert NULL ImageBase64 — the exact
+        // failure mode we hit during validation (ChiroTouch hides the note).
+        // Fail loud with a clear error instead.
+        var signatureImage = await conn.QuerySingleOrDefaultAsync<string?>(
+            """
+            SELECT TOP 1 ImageBase64
+            FROM   dbo.Signatures
+            WHERE  SigType = 'CN'
+              AND  DoctorID = @doctorId
+              AND  ImageBase64 IS NOT NULL
+            ORDER BY SigTimestamp DESC;
+            """,
+            new { doctorId });
+
+        if (string.IsNullOrEmpty(signatureImage))
+            throw new InvalidOperationException(
+                $"Cannot write back: doctor {doctorId} has no stored signature image in PSChiro. " +
+                "ChiroTouch hides notes whose signature has NULL ImageBase64, so the writeback " +
+                "would create an invisible chart note. Have the doctor sign at least one note in " +
+                "ChiroTouch before correcting via portal.");
+
         await using var tx = await conn.BeginTransactionAsync(ct);
 
         try
@@ -80,28 +108,19 @@ public sealed class PSChiroWriteService : IPSChiroWriteService
                 VALUES (@patientId, @doctorId, @noteDate, @ptr, 0, 0, 0, 0, 0, 0);
                 SELECT CAST(SCOPE_IDENTITY() AS int);
                 """,
-                new { patientId, doctorId, noteDate, ptr = newPtr },
+                new { patientId, doctorId, noteDate = anchoredDate, ptr = newPtr },
                 transaction: tx);
 
-            // 3. Signature — copy the doctor's real stored ImageBase64 so
-            //    ChiroTouch renders the note as properly signed. Sub-select
-            //    is intentional: the lugiano_rw account has SELECT on the
-            //    schema, so it can pull the existing image without us having
-            //    to round-trip it through the app.
+            // 3. Signature with the pre-fetched real image. PatientID set so
+            //    the row matches what ChiroTouch's UI expects on a properly
+            //    signed CN row.
             var sigRows = await conn.ExecuteAsync(
                 """
                 INSERT INTO dbo.Signatures
                        (SigType, SigTypeID, SigTimestamp, DoctorID, Base64, ImageFormat, ImageBase64, PatientID)
-                SELECT 'CN', @noteId, GETDATE(), @doctorId, '', '2',
-                       (SELECT TOP 1 ImageBase64
-                        FROM   dbo.Signatures
-                        WHERE  SigType = 'CN'
-                          AND  DoctorID = @doctorId
-                          AND  ImageBase64 IS NOT NULL
-                        ORDER BY SigTimestamp DESC),
-                       @patientId;
+                VALUES ('CN', @noteId, GETDATE(), @doctorId, '', '2', @signatureImage, @patientId);
                 """,
-                new { noteId, doctorId, patientId },
+                new { noteId, doctorId, signatureImage, patientId },
                 transaction: tx);
 
             if (sigRows != 1)

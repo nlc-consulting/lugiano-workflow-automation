@@ -80,6 +80,10 @@ public sealed class ScrubReviewController : ControllerBase
                 latestScrubAt = s.RanAt,
                 latestScrubVerdict = s.Verdict,
                 summary = s.Summary,
+                // The specific failing note. The Doctor View modal passes this
+                // as originalDoctorNoteId on submit so the PSChiro writeback
+                // anchors to the correct visit's date + doctor.
+                doctorNoteId = s.NoteId,
             };
         }).ToList();
 

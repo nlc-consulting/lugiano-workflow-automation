@@ -442,13 +442,33 @@ public sealed class CasesController : ControllerBase
         var wc = await db.WorkflowCases.FirstOrDefaultAsync(c => c.PatientId == id, ct);
         if (wc is null) return NotFound(new { error = $"No workflow case for patient {id}." });
 
-        // Look up the original failing note (when the modal provides it) so
-        // the PSChiro writeback can reuse its date + doctor. ChiroTouch's UI
-        // is appointment-anchored, so a correction must land on the same DOS
-        // as the original note's visit to appear in the chart.
+        // Look up the original failing note so the PSChiro writeback can
+        // reuse its date + doctor. ChiroTouch's UI is appointment-anchored,
+        // so a correction must land on the same DOS as the original note's
+        // visit to appear in the chart.
+        //
+        // Two-step lookup:
+        //   1. Use the explicit OriginalDoctorNoteId from the modal if present
+        //   2. Fall back to "patient's most recent failing per-note scrub"
+        //      so the flow still works even if the frontend didn't supply it
         DoctorNote? original = req.OriginalDoctorNoteId.HasValue
             ? await _cases.GetDoctorNoteByIdAsync(req.OriginalDoctorNoteId.Value)
             : null;
+
+        if (original is null)
+        {
+            // Find the most recent failing per-note scrub for this patient
+            // and use that note as the implicit "original."
+            var recentFailNoteId = await db.ScrubResults.AsNoTracking()
+                .Where(s => s.DoctorNoteId != null
+                            && s.Verdict == ScrubVerdicts.Fail
+                            && db.DoctorNotes.Any(n => n.Id == s.DoctorNoteId && n.PatientId == id))
+                .OrderByDescending(s => s.RanAt)
+                .Select(s => s.DoctorNoteId)
+                .FirstOrDefaultAsync(ct);
+            if (recentFailNoteId.HasValue)
+                original = await _cases.GetDoctorNoteByIdAsync(recentFailNoteId.Value);
+        }
 
         // Doctor attribution: the correction is recorded as the ORIGINAL
         // note's doctor (we're correcting their work in their name). Falls
@@ -494,21 +514,35 @@ public sealed class CasesController : ControllerBase
 
         // Open kickbacks resolved — the doctor just responded, regardless of
         // whether the next scrub passes or fails (it might still fail, in
-        // which case a new kickback gets created downstream).
+        // which case the case stays in the review queue for human follow-up).
         await _corrections.ResolveOpenForPatientAsync(id, ct);
 
-        // Per-note scrub on the newly authored portal correction. Each note
-        // is its own billable unit, so we evaluate this one against its own
-        // (empty for portal-authored) visit DX + charges.
-        var scrub = await _scrubs.RunForNoteAsync(doctorNoteId, ct);
+        // Re-scrub fires in the background so the doctor doesn't wait the
+        // full Claude round-trip (5-15s). The scrub result lands in the queue
+        // and refreshes the case's rolled-up verdict on its own — the doctor
+        // doesn't need to see it in the modal. Captures the scrub orchestrator
+        // by reference (singleton-scoped) and the doctor note id by value.
+        var noteIdForScrub = doctorNoteId;
+        var scrubs = _scrubs;
+        var logger = _logger;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await scrubs.RunForNoteAsync(noteIdForScrub, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex,
+                    "Background re-scrub failed for portal correction note {NoteId}.",
+                    noteIdForScrub);
+            }
+        });
+
         return Ok(new
         {
             doctorNoteId,
             chartNoteId = writebackChartNoteId,
-            scrubId = scrub.Id,
-            verdict = scrub.Verdict,
-            summary = scrub.Summary,
-            ranAt = scrub.RanAt,
         });
     }
 
