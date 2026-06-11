@@ -1,0 +1,28 @@
+/*
+ * react-admin's Layout root ships with `min-width: fit-content`, so it grows to
+ * its widest descendant (a wide datagrid, a long note line) and forces a page-
+ * level horizontal scrollbar. react-admin injects that via Emotion at runtime,
+ * which outranks normal static CSS at equal specificity — so we use !important
+ * to guarantee the override regardless of stylesheet order.
+ *
+ * With the floor removed, the layout root fills its parent and the content
+ * column shrinks to the space left by the (collapsible) sidebar. Genuinely wide
+ * content scrolls inside its own card (see overflow wrappers in the case cards).
+ */
+.RaLayout-root,
+.RaLayout-appFrame,
+.RaLayout-contentWithSidebar,
+.RaLayout-content {
+  min-width: 0 !important;
+}
+
+.RaLayout-content {
+  max-width: 100% !important;
+  overflow-x: hidden;
+}
+
+/* Hard backstop: the document itself never scrolls sideways. */
+html,
+body {
+  overflow-x: hidden;
+}
