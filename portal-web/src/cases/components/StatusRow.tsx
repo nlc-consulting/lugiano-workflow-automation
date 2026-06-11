@@ -2,8 +2,10 @@ import { useRecordContext } from 'react-admin'
 import { Box, Card, CardContent, Chip, Typography } from '@mui/material'
 import CheckCircle from '@mui/icons-material/CheckCircle'
 import RadioButtonUnchecked from '@mui/icons-material/RadioButtonUnchecked'
-import PipDateEditor from '../PipDateEditor'
 import { formatShortDate } from './formatters'
+// PIP is hidden from the UI for the time being — not part of the billing
+// critical path. Restore by re-importing PipDateEditor and re-adding the
+// PIP pill + editor mount below.
 
 type StatusPillProps = {
   label: string
@@ -55,14 +57,6 @@ const StatusRow = () => {
               r.doctorNotesReceivedAt ? `latest ${formatShortDate(r.doctorNotesReceivedAt)}` : 'none yet'
             }
           />
-          <StatusPill
-            label="PIP verified"
-            present={!!r.pipVerified}
-            secondary={r.pipVerifiedAt ? `on ${formatShortDate(r.pipVerifiedAt)}` : 'not verified'}
-          />
-        </Box>
-        <Box sx={{ mt: 2 }}>
-          <PipDateEditor />
         </Box>
       </CardContent>
     </Card>

@@ -40,6 +40,16 @@ const PatientHeader = () => {
   if (!r) return null
   const name = [r.firstName, r.middleName, r.lastName].filter(Boolean).join(' ')
   const address = [r.address, r.city, r.state, r.zip].filter(Boolean).join(', ')
+  // Active case marker mirrors ChiroTouch's "(Auto)" style next to the
+  // patient name. caseType + curInjuryDate come straight from
+  // Patients.CaseType / Patients.CurInjuryDate — patient-level case anchor
+  // (free-text values like "Auto", "Auto 2", "Slip/Fall", "WC").
+  const caseType = (r.caseType as string | null | undefined)?.trim() || null
+  const injuryDate = r.curInjuryDate
+    ? new Date(r.curInjuryDate as string).toLocaleDateString('en-US', {
+        timeZone: 'America/New_York',
+      })
+    : null
   return (
     <Card>
       <CardContent>
@@ -52,11 +62,23 @@ const PatientHeader = () => {
           }}
         >
           <Box>
-            <Typography variant="h5" sx={{ fontWeight: 600 }}>
-              {name || `Patient ${r.patientId}`}
-            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+              <Typography variant="h5" sx={{ fontWeight: 600 }}>
+                {name || `Patient ${r.patientId}`}
+              </Typography>
+              {caseType && (
+                <Chip
+                  size="small"
+                  color="primary"
+                  variant="outlined"
+                  label={caseType}
+                  sx={{ fontWeight: 600 }}
+                />
+              )}
+            </Box>
             <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
               ID {r.patientId} · {r.sex ?? '—'} · {r.primaryDoctor ?? '—'}
+              {injuryDate && <> · accident {injuryDate}</>}
             </Typography>
             {address && (
               <Typography variant="body2" color="text.secondary">

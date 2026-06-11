@@ -29,14 +29,40 @@ type NoteVisit = {
   matchReasons?: string[] | null
 }
 
+type ScrubSnapshot = {
+  verdict?: 'pass' | 'needs_review' | 'fail' | null
+  summary?: string | null
+  ranAt?: string | null
+}
+
 type NoteRow = NoteVisit & {
   id: number
+  // 'chart' = sourced from PSChiro ChartNotes (the normal case)
+  // 'portal' = doctor-authored correction made through our portal (no ChiroTouch row yet)
+  source?: 'chart' | 'portal'
+  // Our internal DoctorNote.Id — present for both chart and portal notes.
+  // The per-tab ScrubPanel keys off this for /notes/{id}/scrub endpoints.
+  doctorNoteId?: number | null
+  portalNoteId?: number
   noteDate?: string | null
   doctor?: string | null
   plainText?: string | null
+  diagnoses?: DiagnosisItem[] | null
+  latestScrub?: ScrubSnapshot | null
 }
 
 type DiagnosisItem = { code: string; description?: string | null }
+
+const SCRUB_LABELS: Record<string, string> = {
+  pass: 'Pass',
+  needs_review: 'Needs review',
+  fail: 'Fail',
+}
+const SCRUB_COLORS: Record<string, 'success' | 'warning' | 'error'> = {
+  pass: 'success',
+  needs_review: 'warning',
+  fail: 'error',
+}
 
 const scoreColor = (score: number): 'success' | 'warning' | 'error' =>
   score >= 85 ? 'success' : score >= 50 ? 'warning' : 'error'
@@ -85,21 +111,27 @@ const renderVisitChip = (note: NoteVisit) => {
 // card below.
 const NotesAndDiagnosesCard = () => {
   const { record } = useShowContext<
-    RaRecord & { patientId: number; notes?: NoteRow[]; diagnoses?: DiagnosisItem[] }
+    RaRecord & { patientId: number; notes?: NoteRow[] }
   >()
-  const notes = record?.notes ?? []
-  const diagnoses = record?.diagnoses ?? []
+  // ChiroTouch is appointment-centric: it only surfaces notes attached to a
+  // visit. We pull every ChartNotes row, so drop notes that matched no
+  // appointment (orphaned rows — e.g. stray test notes) to show the same set
+  // ChiroTouch does.
+  const notes = (record?.notes ?? []).filter((n) => n.visitId != null)
   const [activeNoteId, setActiveNoteId] = useState<number | null>(null)
   const [kickbackOpen, setKickbackOpen] = useState(false)
   const notify = useNotify()
   const refresh = useRefresh()
 
   const currentNote = notes.find((n) => n.id === activeNoteId) ?? notes[0]
+  // Diagnoses are scoped to the active note's visit so the list matches
+  // ChiroTouch's per-note DX panel exactly (it changes as you flip notes).
+  const diagnoses = currentNote?.diagnoses ?? []
 
   return (
     <SectionCard
       title="Notes & diagnoses"
-      caption="Diagnoses stay pinned on the left while you flip between notes — mirroring ChiroTouch's chart-note view."
+      caption="The diagnoses on the left are the DX set for the selected note's visit — mirroring ChiroTouch's chart-note view."
     >
       <Box sx={{ display: 'flex', gap: 2, alignItems: 'flex-start' }}>
         {/* Left rail: persistent patient diagnoses. */}
@@ -109,11 +141,11 @@ const NotesAndDiagnosesCard = () => {
             color="text.secondary"
             sx={{ display: 'block', mb: 1 }}
           >
-            Patient diagnoses ({diagnoses.length})
+            Visit diagnoses ({diagnoses.length})
           </Typography>
           {diagnoses.length === 0 ? (
             <Typography variant="body2" color="text.secondary">
-              No ICD-10 codes found in loaded notes.
+              No diagnoses recorded for this visit.
             </Typography>
           ) : (
             <Box sx={{ display: 'flex', flexDirection: 'column' }}>
@@ -159,19 +191,31 @@ const NotesAndDiagnosesCard = () => {
                 scrollButtons="auto"
                 sx={{ borderBottom: 1, borderColor: 'divider' }}
               >
-                {notes.map((n) => (
-                  <Tab
-                    key={n.id}
-                    value={n.id}
-                    label={
-                      n.noteDate
-                        ? new Date(n.noteDate).toLocaleDateString('en-US', {
-                            timeZone: 'America/New_York',
-                          })
-                        : `Note ${n.id}`
-                    }
-                  />
-                ))}
+                {notes.map((n) => {
+                  const dateStr = n.noteDate
+                    ? new Date(n.noteDate).toLocaleDateString('en-US', {
+                        timeZone: 'America/New_York',
+                      })
+                    : `Note ${Math.abs(n.id)}`
+                  // Portal-authored corrections get a small badge so reviewers
+                  // can tell them apart from PSChiro chart notes in the strip.
+                  const label =
+                    n.source === 'portal' ? (
+                      <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.75 }}>
+                        <span>{dateStr}</span>
+                        <Chip
+                          size="small"
+                          color="primary"
+                          variant="outlined"
+                          label="Portal"
+                          sx={{ height: 18, '& .MuiChip-label': { px: 0.75, fontSize: 10 } }}
+                        />
+                      </Box>
+                    ) : (
+                      dateStr
+                    )
+                  return <Tab key={n.id} value={n.id} label={label} />
+                })}
               </Tabs>
 
               {currentNote && (
@@ -189,16 +233,27 @@ const NotesAndDiagnosesCard = () => {
                       {currentNote.doctor ?? '—'}
                     </Typography>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                      {renderVisitChip(currentNote)}
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        color="primary"
-                        startIcon={<ReplyAll fontSize="small" />}
-                        onClick={() => setKickbackOpen(true)}
-                      >
-                        Send back to doctor
-                      </Button>
+                      {currentNote.source === 'portal' ? (
+                        <Chip
+                          size="small"
+                          color="primary"
+                          variant="outlined"
+                          label="Portal correction"
+                        />
+                      ) : (
+                        <>
+                          {renderVisitChip(currentNote)}
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            color="primary"
+                            startIcon={<ReplyAll fontSize="small" />}
+                            onClick={() => setKickbackOpen(true)}
+                          >
+                            Send back to doctor
+                          </Button>
+                        </>
+                      )}
                     </Box>
                   </Box>
                   {currentNote.plainText ? (
@@ -218,15 +273,25 @@ const NotesAndDiagnosesCard = () => {
                     </Box>
                   ) : (
                     <Typography variant="body2" color="text.secondary">
-                      Note text wasn't reconstructed for this row (the detail view
-                      caps RTF reconstruction at the 3 most recent notes for performance).
+                      Note text not yet available for this row.
                     </Typography>
                   )}
 
-                  <ScrubPanel
-                    patientId={(record?.patientId as number) ?? 0}
-                    chartNoteId={currentNote.id}
-                  />
+                  {/* Per-note scrub. Each note is its own billable unit
+                      (one HCFA claim line per provider visit). The latest
+                      scrub is preloaded inline via currentNote.latestScrub
+                      so the panel renders instantly without a follow-up
+                      fetch. Re-scrub button POSTs to /notes/{id}/scrub. */}
+                  {currentNote.doctorNoteId ? (
+                    <ScrubPanel
+                      doctorNoteId={currentNote.doctorNoteId}
+                      initial={(currentNote.latestScrub as never) ?? null}
+                    />
+                  ) : (
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
+                      This note hasn't been synced into our DB yet — scrub will be available after the next sync cycle.
+                    </Typography>
+                  )}
                 </Box>
               )}
             </>
@@ -234,7 +299,9 @@ const NotesAndDiagnosesCard = () => {
         </Box>
       </Box>
 
-      {currentNote && (
+      {/* Kickback only mounts for chart-sourced notes — portal corrections
+          are themselves the response to a kickback, so re-kicking is a no-op. */}
+      {currentNote && currentNote.source !== 'portal' && (
         <KickbackModal
           open={kickbackOpen}
           onClose={() => setKickbackOpen(false)}

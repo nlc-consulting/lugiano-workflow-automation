@@ -49,8 +49,14 @@ type ScrubResult = {
 }
 
 type Props = {
-  patientId: number
-  chartNoteId: number
+  // The note being scrubbed. doctorNoteId is our internal PK on DoctorNote;
+  // both chart and portal-authored notes have one. All scrub endpoints are
+  // keyed by it.
+  doctorNoteId: number
+  // Optional initial result preloaded with the case detail (avoids a refetch
+  // on mount when the parent already has the latest). The panel will still
+  // POST a fresh scrub on Re-scrub click.
+  initial?: ScrubResult | null
 }
 
 const verdictColor = (v?: string): 'success' | 'warning' | 'error' | 'default' => {
@@ -123,17 +129,24 @@ const SectionRow = ({
   )
 }
 
-const ScrubPanel = ({ patientId, chartNoteId }: Props) => {
-  const [latest, setLatest] = useState<ScrubResult | null>(null)
-  const [loading, setLoading] = useState(false)
+const ScrubPanel = ({ doctorNoteId, initial = null }: Props) => {
+  const [latest, setLatest] = useState<ScrubResult | null>(initial)
+  // Skip the network round-trip when the parent preloaded — /cases/{id} now
+  // embeds each note's latestScrub inline, so the panel renders instantly.
+  const [loading, setLoading] = useState(initial == null)
   const [scrubbing, setScrubbing] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    if (initial !== null) {
+      setLatest(initial)
+      setLoading(false)
+      return
+    }
     setLatest(null)
     setError(null)
     setLoading(true)
-    fetch(`${WORKFLOW_API}/cases/${patientId}/notes/${chartNoteId}/scrub`)
+    fetch(`${WORKFLOW_API}/notes/${doctorNoteId}/scrub`)
       .then(async (r) => {
         if (r.status === 204) return null
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -142,16 +155,13 @@ const ScrubPanel = ({ patientId, chartNoteId }: Props) => {
       .then(setLatest)
       .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load scrub result.'))
       .finally(() => setLoading(false))
-  }, [patientId, chartNoteId])
+  }, [doctorNoteId, initial])
 
   const runScrub = async () => {
     setScrubbing(true)
     setError(null)
     try {
-      const res = await fetch(
-        `${WORKFLOW_API}/cases/${patientId}/notes/${chartNoteId}/scrub`,
-        { method: 'POST' },
-      )
+      const res = await fetch(`${WORKFLOW_API}/notes/${doctorNoteId}/scrub`, { method: 'POST' })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? `HTTP ${res.status}`)
@@ -188,12 +198,16 @@ const ScrubPanel = ({ patientId, chartNoteId }: Props) => {
             <Chip
               size="small"
               color={verdictColor(latest.verdict)}
-              label={`${verdictLabel(latest.verdict)} · ${latest.overallConfidence}`}
+              label={verdictLabel(latest.verdict)}
               sx={{ fontWeight: 600 }}
             />
           )}
           {latest && (
             <Typography variant="caption" color="text.secondary">
+              {/* Confidence is hidden from the header — it reads like a quality
+                  score and confuses reviewers (a high-confidence Fail looks
+                  "good"). Still persisted on ScrubResult.OverallConfidence for
+                  calibration work (task #25). */}
               {new Date(latest.ranAt).toLocaleString('en-US', { timeZone: 'America/New_York' })}
             </Typography>
           )}
@@ -205,7 +219,7 @@ const ScrubPanel = ({ patientId, chartNoteId }: Props) => {
           disabled={scrubbing}
           startIcon={scrubbing ? <CircularProgress size={14} /> : <AutoAwesome fontSize="small" />}
         >
-          {scrubbing ? 'Scrubbing…' : latest ? 'Re-scrub' : 'Scrub this note'}
+          {scrubbing ? 'Scrubbing…' : latest ? 'Re-scrub note' : 'Scrub note'}
         </Button>
       </Box>
 
@@ -221,7 +235,7 @@ const ScrubPanel = ({ patientId, chartNoteId }: Props) => {
 
       {!loading && !latest && !error && !scrubbing && (
         <Typography variant="body2" color="text.secondary">
-          No scrub yet. Click "Scrub this note" to run an AI analysis.
+          No scrub yet. Click "Scrub note" to evaluate this note against its visit's diagnoses.
         </Typography>
       )}
 
@@ -239,24 +253,33 @@ const ScrubPanel = ({ patientId, chartNoteId }: Props) => {
             <SectionRow label="Primary treatment" section={sections?.primary_treatment} />
           </Box>
 
-          {(findings.diagnosis_alignment || findings.charge_alignment) && (
-            <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-              {findings.diagnosis_alignment && (
-                <Chip
-                  size="small"
-                  variant="outlined"
-                  label={`Diagnosis alignment: ${findings.diagnosis_alignment.score ?? '—'}`}
-                />
-              )}
-              {findings.charge_alignment && (
-                <Chip
-                  size="small"
-                  variant="outlined"
-                  label={`Charge alignment: ${findings.charge_alignment.score ?? '—'}`}
-                />
-              )}
-            </Box>
-          )}
+          {(() => {
+            // Hide chips that have no actual issues. The model still fills
+            // charge_alignment.score even when we tell it not to evaluate
+            // charges (prompt v6+), so we suppress the chip unless there's
+            // something to actually look at.
+            const dxHasIssues = (findings.diagnosis_alignment?.issues?.length ?? 0) > 0
+            const chargeHasIssues = (findings.charge_alignment?.issues?.length ?? 0) > 0
+            if (!dxHasIssues && !chargeHasIssues) return null
+            return (
+              <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+                {dxHasIssues && (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Diagnosis alignment: ${findings.diagnosis_alignment?.score ?? '—'}`}
+                  />
+                )}
+                {chargeHasIssues && (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`Charge alignment: ${findings.charge_alignment?.score ?? '—'}`}
+                  />
+                )}
+              </Box>
+            )
+          })()}
 
           {findings.issues && findings.issues.length > 0 && (
             <Box>

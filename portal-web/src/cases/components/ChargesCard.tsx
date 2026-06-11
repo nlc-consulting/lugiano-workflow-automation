@@ -7,7 +7,7 @@ import {
   useRecordContext,
   type RaRecord,
 } from 'react-admin'
-import { Typography } from '@mui/material'
+import { Box, Typography } from '@mui/material'
 import SectionCard from './SectionCard'
 
 const formatAmount = (n?: number) =>
@@ -32,28 +32,30 @@ const ChargesCard = () => {
         ) : null
       }
     >
-      <ArrayField source="charges">
-        <Datagrid
-          bulkActionButtons={false}
-          rowClick={false}
-          empty={
-            <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
-              No charges entered for the visits matched to recent notes.
-            </Typography>
-          }
-        >
-          <DateField source="date" label="Date" />
-          <TextField source="code" label="Code" />
-          <TextField source="description" label="Description" />
-          <TextField source="modifier1" label="M1" />
-          <TextField source="modifier2" label="M2" />
-          <TextField source="diagnoses" label="Diagnoses" />
-          <FunctionField
-            label="Amount"
-            render={(row: RaRecord) => formatAmount(row.amount)}
-          />
-        </Datagrid>
-      </ArrayField>
+      <Box sx={{ overflowX: 'auto' }}>
+        <ArrayField source="charges">
+          <Datagrid
+            bulkActionButtons={false}
+            rowClick={false}
+            empty={
+              <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+                No charges entered for the visits matched to recent notes.
+              </Typography>
+            }
+          >
+            <DateField source="date" label="Date" />
+            <TextField source="code" label="Code" />
+            <TextField source="description" label="Description" />
+            <TextField source="modifier1" label="M1" />
+            <TextField source="modifier2" label="M2" />
+            <TextField source="diagnoses" label="Diagnoses" />
+            <FunctionField
+              label="Amount"
+              render={(row: RaRecord) => formatAmount(row.amount)}
+            />
+          </Datagrid>
+        </ArrayField>
+      </Box>
     </SectionCard>
   )
 }
