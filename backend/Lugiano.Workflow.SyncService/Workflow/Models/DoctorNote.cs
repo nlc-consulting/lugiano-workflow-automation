@@ -5,7 +5,11 @@ public sealed class DoctorNote
     public int Id { get; set; }
     public int WorkflowCaseId { get; set; }
     public int PatientId { get; set; }
-    public int ChartNoteId { get; set; }
+    // Null for portal-authored corrections: the doctor responded inside our
+    // portal instead of ChiroTouch, so there's no ChartNotes row to link to.
+    // The unique index is filtered on NOT NULL so multiple portal-authored
+    // rows can coexist.
+    public int? ChartNoteId { get; set; }
     // ChiroTouch doctor ID (dbo.ChartNotes.DoctorID). Joins to
     // Doctor.ChiroTouchDoctorId — NOT to Doctor.Id (our local PK).
     public int? DoctorId { get; set; }

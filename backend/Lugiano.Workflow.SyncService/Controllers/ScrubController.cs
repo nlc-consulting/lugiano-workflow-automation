@@ -11,15 +11,15 @@ public sealed class ScrubController : ControllerBase
 
     public ScrubController(ScrubOrchestrator orchestrator) => _orchestrator = orchestrator;
 
-    // POST /cases/{patientId}/notes/{chartNoteId}/scrub
-    // Manually runs the scrubber against a single note. Synchronous — the
-    // request blocks for ~5-15s while Claude responds.
-    [HttpPost("cases/{patientId:int}/notes/{chartNoteId:int}/scrub")]
-    public async Task<IActionResult> Scrub(int patientId, int chartNoteId, CancellationToken ct)
+    // POST /notes/{doctorNoteId}/scrub — run a per-note scrub. The note's
+    // visit defines DX + charges scope; brief chart context rides along.
+    // Synchronous; blocks ~5-15s while Claude responds.
+    [HttpPost("notes/{doctorNoteId:int}/scrub")]
+    public async Task<IActionResult> Scrub(int doctorNoteId, CancellationToken ct)
     {
         try
         {
-            var result = await _orchestrator.RunByChartNoteIdAsync(patientId, chartNoteId, ct);
+            var result = await _orchestrator.RunForNoteAsync(doctorNoteId, ct);
             return Ok(Project(result));
         }
         catch (InvalidOperationException ex)
@@ -28,11 +28,11 @@ public sealed class ScrubController : ControllerBase
         }
     }
 
-    // GET /cases/{patientId}/notes/{chartNoteId}/scrub — latest result if any.
-    [HttpGet("cases/{patientId:int}/notes/{chartNoteId:int}/scrub")]
-    public async Task<IActionResult> GetLatest(int patientId, int chartNoteId, CancellationToken ct)
+    // GET /notes/{doctorNoteId}/scrub — latest scrub result for this note.
+    [HttpGet("notes/{doctorNoteId:int}/scrub")]
+    public async Task<IActionResult> GetLatest(int doctorNoteId, CancellationToken ct)
     {
-        var result = await _orchestrator.GetLatestForChartNoteAsync(patientId, chartNoteId, ct);
+        var result = await _orchestrator.GetLatestForNoteAsync(doctorNoteId, ct);
         if (result is null) return NoContent();
         return Ok(Project(result));
     }

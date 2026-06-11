@@ -36,13 +36,19 @@ builder.Services.AddSingleton(workerOptions);
 builder.Services.AddDbContextFactory<WorkflowDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("WorkflowAutomation")));
 
-// ChiroTouch DB (source): Dapper, read-only.
+// ChiroTouch DB (source): Dapper, read-only (lugiano_ro).
 builder.Services.AddSingleton<ISourceDbConnectionFactory, SourceDbConnectionFactory>();
 builder.Services.AddSingleton<IInsuranceReadQueries, InsuranceReadQueries>();
 builder.Services.AddSingleton<IChartNoteReadQueries, ChartNoteReadQueries>();
 builder.Services.AddSingleton<IPatientDetailQueries, PatientDetailQueries>();
 builder.Services.AddSingleton<IPatientStatusQueries, PatientStatusQueries>();
 builder.Services.AddSingleton<IDoctorReadQueries, DoctorReadQueries>();
+
+// ChiroTouch DB (write): separate lugiano_rw account, INSERT-only on the 3
+// writeback tables (ChartText, ChartNotes, Signatures). Intentionally a
+// distinct factory + service so reads can never accidentally write.
+builder.Services.AddSingleton<ISourceDbWriteConnectionFactory, SourceDbWriteConnectionFactory>();
+builder.Services.AddSingleton<IPSChiroWriteService, PSChiroWriteService>();
 
 builder.Services.AddSingleton<SyncStateService>();
 builder.Services.AddSingleton<WorkflowCaseService>();

@@ -120,6 +120,40 @@ public sealed class WorkflowCaseService
         return await db.DoctorNotes.AnyAsync(x => x.ChartNoteId == chartNoteId);
     }
 
+    // Resolve the DoctorNote.Id for a given PSChiro ChartNote.Id. Used by the
+    // sync auto-scrub trigger which knows the chart-note ID and needs to hand
+    // the orchestrator our internal note ID.
+    public async Task<int?> GetDoctorNoteIdByChartNoteIdAsync(int chartNoteId)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        return await db.DoctorNotes
+            .Where(x => x.ChartNoteId == chartNoteId)
+            .Select(x => (int?)x.Id)
+            .FirstOrDefaultAsync();
+    }
+
+    // Look up a DoctorNote by our internal Id. Used by the portal-correction
+    // submit endpoint to find the original failing note so its date + doctor
+    // can be reused for the PSChiro writeback.
+    public async Task<DoctorNote?> GetDoctorNoteByIdAsync(int doctorNoteId)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        return await db.DoctorNotes.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == doctorNoteId);
+    }
+
+    // After a successful PSChiro writeback, link our portal-authored DoctorNote
+    // to the newly-created PSChiro ChartNote.Id so the relationship is
+    // bidirectional and future sync runs don't try to re-import the writeback.
+    public async Task LinkPortalNoteToChartNoteAsync(int doctorNoteId, int chartNoteId)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        var row = await db.DoctorNotes.FirstOrDefaultAsync(x => x.Id == doctorNoteId);
+        if (row is null) return;
+        row.ChartNoteId = chartNoteId;
+        await db.SaveChangesAsync();
+    }
+
     // True when we already have at least one DoctorNote for this patient.
     // Used by the sync service to decide whether to trigger a full history
     // backfill on first encounter.
@@ -132,12 +166,39 @@ public sealed class WorkflowCaseService
     public async Task InsertDoctorNoteAsync(DoctorNote note)
     {
         await using var db = await _dbFactory.CreateDbContextAsync();
-        bool exists = await db.DoctorNotes.AnyAsync(x => x.ChartNoteId == note.ChartNoteId);
-        if (exists)
-            return;
-
+        // Dedupe only applies to ChiroTouch-sourced notes (ChartNoteId set).
+        // Portal-authored corrections (ChartNoteId == null) are always new.
+        if (note.ChartNoteId.HasValue)
+        {
+            bool exists = await db.DoctorNotes.AnyAsync(x => x.ChartNoteId == note.ChartNoteId);
+            if (exists) return;
+        }
         note.CreatedAt = DateTime.UtcNow;
         db.DoctorNotes.Add(note);
         await db.SaveChangesAsync();
+    }
+
+    // Inserts a doctor-authored correction note made through the portal (no
+    // ChiroTouch ChartNote). Returns the new DoctorNote.Id so the caller can
+    // trigger an immediate re-scrub on it.
+    public async Task<int> InsertPortalAuthoredNoteAsync(
+        int workflowCaseId, int patientId, int? doctorId, string text, DateTime? noteDate = null)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        var note = new DoctorNote
+        {
+            WorkflowCaseId = workflowCaseId,
+            PatientId = patientId,
+            ChartNoteId = null,
+            DoctorId = doctorId,
+            NoteDate = noteDate ?? DateTime.UtcNow,
+            SoapPtr = null,
+            RawRtf = null,
+            PlainText = text,
+            CreatedAt = DateTime.UtcNow,
+        };
+        db.DoctorNotes.Add(note);
+        await db.SaveChangesAsync();
+        return note.Id;
     }
 }

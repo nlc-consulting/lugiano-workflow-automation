@@ -89,8 +89,11 @@ public sealed class WorkflowDbContext : DbContext
             e.ToTable("DoctorNote");
             e.HasKey(x => x.Id);
             e.Property(x => x.CreatedAt).HasDefaultValueSql("SYSUTCDATETIME()");
-            // Idempotency: one DoctorNote per ChartNote.
-            e.HasIndex(x => x.ChartNoteId).IsUnique();
+            // Idempotency: one DoctorNote per ChartNote. Filter NULL out so
+            // portal-authored rows (ChartNoteId IS NULL) can coexist.
+            e.HasIndex(x => x.ChartNoteId)
+                .IsUnique()
+                .HasFilter("[ChartNoteId] IS NOT NULL");
         });
 
         b.Entity<Doctor>(e =>

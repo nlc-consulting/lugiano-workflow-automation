@@ -137,7 +137,7 @@ namespace Lugiano.Workflow.SyncService.Migrations
 
                     SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
 
-                    b.Property<int>("ChartNoteId")
+                    b.Property<int?>("ChartNoteId")
                         .HasColumnType("int");
 
                     b.Property<DateTime>("CreatedAt")
@@ -169,7 +169,8 @@ namespace Lugiano.Workflow.SyncService.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("ChartNoteId")
-                        .IsUnique();
+                        .IsUnique()
+                        .HasFilter("[ChartNoteId] IS NOT NULL");
 
                     b.HasIndex("WorkflowCaseId");
 
@@ -184,7 +185,7 @@ namespace Lugiano.Workflow.SyncService.Migrations
 
                     SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
 
-                    b.Property<int>("DoctorNoteId")
+                    b.Property<int?>("DoctorNoteId")
                         .HasColumnType("int");
 
                     b.Property<string>("FindingsJson")
