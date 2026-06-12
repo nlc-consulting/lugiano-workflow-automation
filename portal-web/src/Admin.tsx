@@ -3,8 +3,8 @@ import { createTheme } from '@mui/material/styles'
 import People from '@mui/icons-material/People'
 import Dashboard from '@mui/icons-material/Dashboard'
 import PersonSearch from '@mui/icons-material/PersonSearch'
-import ReportProblem from '@mui/icons-material/ReportProblem'
 import MedicalServices from '@mui/icons-material/MedicalServices'
+import Receipt from '@mui/icons-material/Receipt'
 import { authProvider } from './authProvider'
 import portalDataProvider from './dataProvider'
 import workflowDataProvider from './workflowDataProvider'
@@ -12,10 +12,10 @@ import UserList from './users/UserList'
 import CaseList from './cases/CaseList'
 import CaseShow from './cases/CaseShow'
 import PatientList from './patients/PatientList'
-import ScrubReviewList from './scrub-review/ScrubReviewList'
 import HumanReviewList from './human-review/HumanReviewList'
 import Gavel from '@mui/icons-material/Gavel'
 import DoctorReviewList from './doctor-view/DoctorReviewList'
+import EobPreview from './eob/EobPreview'
 import Login from './Login'
 
 const LUGIANO_RED = '#E11D2A'
@@ -75,12 +75,14 @@ export const AppAdmin = () => (
       icon={Dashboard}
       options={{ label: 'Workflow' }}
     />
-    {/* Failed-scrub triage queue. No show route — clicks navigate to /cases/{id}/show. */}
+    {/* Doctor's queue. Reuses scrub-review data + adds the in-place correction
+        modal — the actual demo path. The bare scrub-review resource below
+        keeps the dataProvider routing alive without showing in the sidebar. */}
     <Resource
-      name="scrub-review"
-      list={ScrubReviewList}
-      icon={ReportProblem}
-      options={{ label: 'Doctor Queue' }}
+      name="doctor-view"
+      list={DoctorReviewList}
+      icon={MedicalServices}
+      options={{ label: 'Doctor View' }}
     />
     <Resource
       name="human-review"
@@ -88,15 +90,19 @@ export const AppAdmin = () => (
       icon={Gavel}
       options={{ label: 'Human Review' }}
     />
-    {/* Doctor's queue. Demo-shortcut: same data as scrub-review, no real role
-        scoping yet. The list reuses resource="scrub-review" but adds an
-        in-place correction modal. */}
+    {/* EOB posting preview. Not a CRUD resource — the "list" is the upload
+        + preview page itself. Read-only — no writeback to PSChiro yet. */}
     <Resource
-      name="doctor-view"
-      list={DoctorReviewList}
-      icon={MedicalServices}
-      options={{ label: 'Doctor View' }}
+      name="eob"
+      list={EobPreview}
+      icon={Receipt}
+      options={{ label: 'EOB' }}
     />
+    {/* Hidden from the sidebar (no list/icon) — kept registered so the
+        workflowDataProvider still routes scrub-review fetches from
+        DoctorReviewList. Reintroduce as a top-level entry once a separate
+        reviewer-only triage view is needed. */}
+    <Resource name="scrub-review" />
     <Resource name="users" list={UserList} icon={People} />
   </Admin>
 )

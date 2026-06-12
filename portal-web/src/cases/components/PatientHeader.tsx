@@ -10,8 +10,10 @@ const stateColor = (state?: string): 'error' | 'warning' | 'success' | 'default'
     case 'AwaitingPipVerification':
     case 'AwaitingDoctorNotes':
     case 'AwaitingDoctorCorrection':
+    case 'AwaitingCharges':
       return 'warning'
     case 'ReadyForAiScrubbing':
+    case 'ReadyForBilling':
       return 'success'
     default:
       return 'default'
@@ -28,8 +30,12 @@ const stateLabel = (state?: string): string => {
       return 'Awaiting doctor notes'
     case 'AwaitingDoctorCorrection':
       return 'Awaiting doctor correction'
+    case 'AwaitingCharges':
+      return 'Awaiting charges'
     case 'ReadyForAiScrubbing':
       return 'Ready for AI scrubbing'
+    case 'ReadyForBilling':
+      return 'Ready for billing'
     default:
       return state ?? '—'
   }

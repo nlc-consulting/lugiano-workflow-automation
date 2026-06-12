@@ -40,31 +40,36 @@ const moneyFmt = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
 })
 
-// Outstanding-charges chip — the third billing-readiness gate. Shows the $
-// total only; the underlying "what visits/lines" lives on the case detail.
-// Reviewers scan the column to find cases ready to bill; muted "All billed"
-// quietly drops fully-billed cases off the eye line.
+// Insurance balance chip — what insurance still owes us (unbilled + AR).
+// "$0" with muted styling = fully paid (rare for active Auto cases). A
+// dollar amount = collectible work, whether it's net-new (still needs a
+// claim sent) or follow-up (already on a claim, EOB pending). The unbilled
+// count + oldest-charge date ride in the tooltip so reviewers can tell the
+// two apart without leaving the dashboard.
 const OutstandingChargesChip = ({ row }: { row: CaseRecord }) => {
-  const count = row.outstandingChargesCount ?? 0
-  if (count === 0) {
+  const balance = row.outstandingChargesTotal ?? 0
+  const unbilledCount = row.outstandingChargesCount ?? 0
+  if (balance === 0) {
     return (
-      <Chip size="small" variant="outlined" label="All billed" sx={{ opacity: 0.65 }} />
+      <Chip size="small" variant="outlined" label="$0" sx={{ opacity: 0.5 }} />
     )
   }
-  const total = row.outstandingChargesTotal ?? 0
   const oldest = row.oldestOutstandingChargeDate
     ? new Date(row.oldestOutstandingChargeDate).toLocaleDateString('en-US', {
         timeZone: 'America/New_York',
       })
     : null
-  const tooltip = oldest ? `Oldest unbilled charge: ${oldest}` : ''
+  const tooltipParts: string[] = []
+  if (unbilledCount > 0) tooltipParts.push(`${unbilledCount} unbilled charge${unbilledCount === 1 ? '' : 's'}`)
+  if (oldest && unbilledCount > 0) tooltipParts.push(`oldest ${oldest}`)
+  if (unbilledCount === 0) tooltipParts.push('All claims sent — AR with insurance')
   return (
-    <Tooltip title={tooltip} arrow>
+    <Tooltip title={tooltipParts.join(' · ')} arrow>
       <Chip
         size="small"
         color="primary"
         variant="outlined"
-        label={moneyFmt.format(total)}
+        label={moneyFmt.format(balance)}
         sx={{ fontWeight: 600 }}
       />
     </Tooltip>
@@ -73,10 +78,12 @@ const OutstandingChargesChip = ({ row }: { row: CaseRecord }) => {
 
 // Case-level scrub status. One verdict per case — no coverage math, no
 // partial state. Either the case has been scrubbed or it hasn't, and if it
-// has the verdict is the whole-bundle judgment.
+// has the verdict is the whole-bundle judgment. Unscrubbed cases read as
+// "Scrub pending" since auto-scrub is wired — the absence of a verdict
+// means the run hasn't completed yet, not that someone forgot.
 const ScrubStatusChip = ({ row }: { row: CaseRecord }) => {
   if (!row.latestScrubVerdict) {
-    return <Chip size="small" variant="outlined" label="Not scrubbed" />
+    return <Chip size="small" variant="outlined" label="Scrub pending" />
   }
   const tooltip = row.latestScrubAt
     ? `Latest run: ${new Date(row.latestScrubAt).toLocaleString('en-US', {

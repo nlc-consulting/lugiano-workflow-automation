@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Datagrid,
   FunctionField,
@@ -34,6 +34,15 @@ type ReviewRow = RaRecord & {
   lastName?: string
   latestScrubAt?: string | null
   summary?: string | null
+  doctorNoteId?: number
+  // The failing note's plain-text body. Modal pre-fills the textarea with
+  // this so the doctor edits the existing note in place rather than
+  // re-authoring from scratch.
+  originalText?: string | null
+  // Authoring doctor's name. Admins see the full queue today; this column
+  // makes it obvious which doctor would actually own each row once portal
+  // logins are scoped (task #40).
+  doctor?: string | null
 }
 
 type CorrectionResponse = {
@@ -71,6 +80,12 @@ const CorrectionModal = ({
   const [error, setError] = useState<string | null>(null)
   const notify = useNotify()
   const refresh = useRefresh()
+
+  // Pre-fill the textarea with the failing note's existing body so the doctor
+  // edits in place. Re-runs when the row changes (open a different case).
+  useEffect(() => {
+    setText(row?.originalText ?? '')
+  }, [row?.doctorNoteId, row?.originalText])
 
   const reset = () => {
     setText('')
@@ -143,18 +158,25 @@ const CorrectionModal = ({
         {!result ? (
           <>
             <DialogContentText sx={{ mb: 1.5 }}>
-              Write the corrected note below. On submit, the system re-scrubs
-              immediately and the new verdict shows here.
+              The original note is loaded below — edit it in place to address
+              the AI feedback. The full edited note is what gets written back
+              to ChiroTouch.
             </DialogContentText>
             <MuiTextField
               autoFocus
               multiline
-              minRows={8}
+              minRows={14}
+              maxRows={28}
               fullWidth
-              placeholder="Subjective: ...\nObjective: ...\nAssessment: In my opinion, ...\nPlan: ..."
+              placeholder={
+                row.originalText
+                  ? ''
+                  : 'Subjective: ...\nObjective: ...\nAssessment: In my opinion, ...\nPlan: ...'
+              }
               value={text}
               onChange={(e) => setText(e.target.value)}
               disabled={submitting}
+              sx={{ fontFamily: 'monospace' }}
             />
             {error && (
               <Alert severity="error" sx={{ mt: 2 }}>
@@ -227,6 +249,10 @@ const DoctorReviewList = () => {
             render={(r: ReviewRow) =>
               `${r.lastName ?? ''}, ${r.firstName ?? ''}`.replace(/^, |, $/, '').trim()
             }
+          />
+          <FunctionField
+            label="Doctor"
+            render={(r: ReviewRow) => r.doctor ?? '—'}
           />
           <EstDateTimeField source="latestScrubAt" label="Last scrub" />
           <TextField source="summary" label="Reason" />
