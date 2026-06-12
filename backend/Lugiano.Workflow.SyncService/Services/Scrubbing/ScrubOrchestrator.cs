@@ -139,20 +139,17 @@ public sealed class ScrubOrchestrator
             .FirstOrDefaultAsync(ct);
     }
 
-    // Auto-scrub gate: fire when a new note arrives if the patient's last
-    // note-scrub never ran OR last verdict was a fail. Pass-state cases skip
-    // so we don't re-scrub a clean chart on every arrival.
-    public async Task<bool> ShouldAutoScrubAsync(int workflowCaseId, CancellationToken ct = default)
+    // Auto-scrub gate: per-NOTE, not per-case. Each new DoctorNote is its own
+    // evaluation unit (per-note scrubbing) — a prior Pass on an older note no
+    // longer means the new note can be skipped. Returns true unless this
+    // specific note already has a scrub (idempotency safety for sync re-runs).
+    public async Task<bool> ShouldAutoScrubAsync(int doctorNoteId, CancellationToken ct = default)
     {
         await using var db = await _dbFactory.CreateDbContextAsync(ct);
-        var latestVerdict = await db.ScrubResults
+        var alreadyScrubbed = await db.ScrubResults
             .AsNoTracking()
-            .Where(s => s.WorkflowCaseId == workflowCaseId)
-            .OrderByDescending(s => s.RanAt)
-            .Select(s => s.Verdict)
-            .FirstOrDefaultAsync(ct);
-
-        return latestVerdict is null || latestVerdict == ScrubVerdicts.Fail;
+            .AnyAsync(s => s.DoctorNoteId == doctorNoteId, ct);
+        return !alreadyScrubbed;
     }
 
     private static string Truncate(string? s, int max) =>

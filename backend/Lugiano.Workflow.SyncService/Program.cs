@@ -49,6 +49,7 @@ builder.Services.AddSingleton<IDoctorReadQueries, DoctorReadQueries>();
 // distinct factory + service so reads can never accidentally write.
 builder.Services.AddSingleton<ISourceDbWriteConnectionFactory, SourceDbWriteConnectionFactory>();
 builder.Services.AddSingleton<IPSChiroWriteService, PSChiroWriteService>();
+builder.Services.AddSingleton<EobPreviewService>();
 
 builder.Services.AddSingleton<SyncStateService>();
 builder.Services.AddSingleton<WorkflowCaseService>();

@@ -81,37 +81,51 @@ public sealed class CasesController : ControllerBase
             .Select(g => g.OrderByDescending(s => s.RanAt).First())
             .ToList();
 
-        var notesPerCase = await db.DoctorNotes.AsNoTracking()
+        // Latest note per case by clinical NoteDate (tiebreak on Id — newer Id
+        // wins on same-date). Drives LastNoteDate + the scrub rollup. EF Core 8
+        // doesn't translate `g.OrderBy(...).First()` projections inside GroupBy
+        // (EmptyProjectionMember), so we pull the rows and group in memory —
+        // bounded by page size × ~50 notes per case, cheap.
+        var notesForCases = await db.DoctorNotes.AsNoTracking()
             .Where(n => caseIds.Contains(n.WorkflowCaseId))
-            .GroupBy(n => n.WorkflowCaseId)
-            .Select(g => new { CaseId = g.Key, Count = g.Count() })
-            .ToDictionaryAsync(x => x.CaseId, x => x.Count);
-
-        // Dashboard rollup: just the LATEST per-note scrub for the case (by
-        // RanAt). Matches the reviewer's mental model — "what's the most
-        // recent activity?" — and stays in sync with what they see when they
-        // click in. Failing older notes still surface in Doctor Queue and
-        // Human Review tabs, which filter on per-note latest verdict
-        // independently.
-        var scrubByCase = latestByNote
-            .GroupBy(s => s.WorkflowCaseId)
+            .Select(n => new { CaseId = n.WorkflowCaseId, NoteId = n.Id, n.NoteDate })
+            .ToListAsync();
+        var latestNotePerCase = notesForCases
+            .GroupBy(n => n.CaseId)
             .ToDictionary(
                 g => g.Key,
                 g =>
                 {
-                    var latest = g.OrderByDescending(s => s.RanAt).First();
-                    return new
-                    {
-                        Verdict = latest.Verdict,
-                        RanAt = latest.RanAt,
-                    };
+                    var latest = g.OrderByDescending(n => n.NoteDate).ThenByDescending(n => n.NoteId).First();
+                    return new { latest.NoteId, latest.NoteDate };
                 });
 
-        // Outstanding charges (third billing-readiness gate). Unbilled service
-        // charges per patient. Patients not in the dict have nothing pending.
+        // Dashboard rollup: verdict of the LATEST NOTE's most recent scrub
+        // (not "latest scrub run across notes"). Matches the user rule
+        // "workflow table always deals with the last note and scrub result."
+        // Older notes' verdicts still surface in Doctor Queue / Human Review,
+        // which filter independently.
+        var scrubByCase = latestByNote
+            .Where(s => latestNotePerCase.TryGetValue(s.WorkflowCaseId, out var latest)
+                        && latest.NoteId == s.NoteId)
+            .ToDictionary(
+                s => s.WorkflowCaseId,
+                s => new { Verdict = s.Verdict, RanAt = s.RanAt });
+
+        // Two complementary signals:
+        //  - outstandingByPatient: count of UNBILLED charges (no BilledCharges
+        //    row). Drives state transitions — ReadyForBilling requires "new
+        //    work to claim" (unbilled > 0), AwaitingCharges otherwise.
+        //  - insuranceByPatient: full insurance balance (unbilled + AR).
+        //    Drives the dashboard chip — what insurance still owes us total.
+        //    "All billed" was misleading when AR was sitting unpaid; the chip
+        //    now shows the real dollar amount we can still collect against.
         var outstandingByPatient = _detail.IsConfigured
             ? await _detail.GetOutstandingChargesAsync(patientIds)
             : new Dictionary<int, OutstandingChargesSummary>();
+        var insuranceByPatient = _detail.IsConfigured
+            ? await _detail.GetInsuranceBalancesAsync(patientIds)
+            : new Dictionary<int, decimal>();
 
         var rows = cases.Select(c =>
         {
@@ -120,19 +134,24 @@ public sealed class CasesController : ControllerBase
             var pip = c.PipVerifiedAt != null;
             var scrub = scrubByCase.GetValueOrDefault(c.Id);
             outstandingByPatient.TryGetValue(c.PatientId, out var outstanding);
+            var insuranceBalance = insuranceByPatient.GetValueOrDefault(c.PatientId);
 
             return new CaseDto(
                 c.PatientId, c.PatientId, c.FirstName, c.LastName,
-                DeriveDashboardState(insurance, pip, notes, scrub?.Verdict, outstanding?.Count ?? 0),
+                DeriveDashboardState(insurance, pip, notes, scrub?.Verdict, insuranceBalance),
                 insurance, notes, pip,
                 c.InsuranceAddedAt, c.DoctorNotesReceivedAt, c.PipVerifiedAt,
                 c.CreatedAt, c.UpdatedAt,
                 LatestScrubVerdict: scrub?.Verdict,
                 LatestScrubAt: scrub?.RanAt,
                 OutstandingChargesCount: outstanding?.Count ?? 0,
-                OutstandingChargesTotal: outstanding?.TotalAmount ?? 0m,
+                // Repurposed: this field now carries the full insurance balance
+                // (unbilled + AR), not just unbilled charges. The frontend
+                // chip reads it as "what insurance owes us total".
+                OutstandingChargesTotal: insuranceBalance,
                 OldestOutstandingChargeDate: outstanding?.OldestChargeDate,
-                LastNoteDate: c.DoctorNotesReceivedAt);
+                LastNoteDate: latestNotePerCase.GetValueOrDefault(c.Id)?.NoteDate
+                              ?? c.DoctorNotesReceivedAt);
         }).ToList();
 
         var last = total == 0 ? 0 : Math.Min(skip + rows.Count - 1, total - 1);
@@ -351,27 +370,37 @@ public sealed class CasesController : ControllerBase
             })
             .FirstOrDefaultAsync();
 
-        // Case rollup from the per-note dictionary built earlier
-        // (patientLatestPerNote). CaseScrubCard renders this; per-tab
-        // ScrubPanel reads each note's own latestScrub directly.
+        // Latest note by clinical NoteDate (tiebreak on Id) — same rule as
+        // the dashboard rollup. Drives both the case-level scrub headline
+        // and the state derivation below.
+        var latestDoctorNoteId = await noteDb.DoctorNotes.AsNoTracking()
+            .Where(n => n.PatientId == id)
+            .OrderByDescending(n => n.NoteDate).ThenByDescending(n => n.Id)
+            .Select(n => (int?)n.Id)
+            .FirstOrDefaultAsync();
+
+        ScrubResult? latestNoteScrub = null;
+        if (latestDoctorNoteId.HasValue)
+            patientLatestPerNote.TryGetValue(latestDoctorNoteId.Value, out latestNoteScrub);
+
+        // Case rollup: verdict of the LATEST NOTE's most recent scrub. The
+        // counts (pass / needs_review / fail) stay alongside as context so
+        // the reviewer sees "today's note passed, but 2 older ones need
+        // review" at a glance — the headline still mirrors the dashboard.
         object? caseScrubSummary = null;
         if (patientLatestPerNote.Count > 0)
         {
             int passCount = patientLatestPerNote.Values.Count(s => s.Verdict == ScrubVerdicts.Pass);
             int needsReviewCount = patientLatestPerNote.Values.Count(s => s.Verdict == ScrubVerdicts.NeedsReview);
             int failCount = patientLatestPerNote.Values.Count(s => s.Verdict == ScrubVerdicts.Fail);
-            string? rolled =
-                failCount > 0 ? ScrubVerdicts.Fail :
-                needsReviewCount > 0 ? ScrubVerdicts.NeedsReview :
-                ScrubVerdicts.Pass;
             caseScrubSummary = new
             {
-                rolledVerdict = rolled,
+                rolledVerdict = latestNoteScrub?.Verdict,
                 passCount,
                 needsReviewCount,
                 failCount,
                 scrubbedNoteCount = patientLatestPerNote.Count,
-                latestRanAt = patientLatestPerNote.Values.Max(s => s.RanAt),
+                latestRanAt = latestNoteScrub?.RanAt ?? patientLatestPerNote.Values.Max(s => s.RanAt),
             };
         }
 
@@ -380,19 +409,13 @@ public sealed class CasesController : ControllerBase
         var pip = wc?.PipVerifiedAt != null;
         // Always derive from the live ChiroTouch truth so the detail can't drift
         // from a stale stored state. Same upgrade-to-ReadyForBilling rule as
-        // the dashboard: latest-per-note scrub passed + has unbilled charges.
-        var latestPatientScrubVerdict = patientLatestPerNote.Count == 0
-            ? null
-            : patientLatestPerNote.Values
-                .OrderByDescending(s => s.RanAt)
-                .First()
-                .Verdict;
-        var outstandingCount = _detail.IsConfigured
-            ? (await _detail.GetOutstandingChargesAsync(new[] { id }))
-                .GetValueOrDefault(id)?.Count ?? 0
-            : 0;
+        // the dashboard: latest-NOTE scrub passed + insurance still owes money.
+        var insuranceBalanceDetail = _detail.IsConfigured
+            ? (await _detail.GetInsuranceBalancesAsync(new[] { id }))
+                .GetValueOrDefault(id)
+            : 0m;
         var state = DeriveDashboardState(
-            insurance, pip, hasNotes, latestPatientScrubVerdict, outstandingCount);
+            insurance, pip, hasNotes, latestNoteScrub?.Verdict, insuranceBalanceDetail);
 
         return Ok(new
         {
@@ -582,21 +605,26 @@ public sealed class CasesController : ControllerBase
         return Ok(new { id, patientId = id, pipVerified = true, pipVerifiedAt = verified });
     }
 
-    // Dashboard/detail state derivation. Starts from the BillingReadiness cascade
-    // (insurance → notes → ReadyForAiScrubbing), then upgrades to ReadyForBilling
-    // when the latest per-note scrub passed AND there are unbilled charges sitting
-    // on the patient. Mirrors the demo framing: "ready for billing for appointment".
-    // Per-appointment state (one per visit, not one per patient) is the proper
-    // fix — tracked separately; this read-time derivation is the bridge.
+    // Dashboard/detail state derivation. Cascade: insurance → notes →
+    // ReadyForAiScrubbing → (pass + insurance owes us) ReadyForBilling, or
+    // (pass + insurance owes nothing) AwaitingCharges. Per-appointment state
+    // (one per visit, not one per patient) is the proper fix — tracked as
+    // task #53; this read-time derivation is the bridge.
+    //
+    // Gates on insurance balance (unbilled + AR), not just unbilled count —
+    // a case with all claims sent but $$ in AR is still "ReadyForBilling"
+    // from a billing-team perspective (collectible work). AwaitingCharges
+    // means "clean slate, waiting for next visit's charges to land".
     private static string DeriveDashboardState(
-        bool insurance, bool pip, bool notes, string? latestScrubVerdict, int outstandingCount)
+        bool insurance, bool pip, bool notes, string? latestScrubVerdict, decimal insuranceBalance)
     {
         var baseState = new BillingReadiness(Insurance: insurance, Pip: pip, Notes: notes).DerivedState;
         if (baseState == WorkflowStates.ReadyForAiScrubbing
-            && latestScrubVerdict == ScrubVerdicts.Pass
-            && outstandingCount > 0)
+            && latestScrubVerdict == ScrubVerdicts.Pass)
         {
-            return WorkflowStates.ReadyForBilling;
+            return insuranceBalance > 0
+                ? WorkflowStates.ReadyForBilling
+                : WorkflowStates.AwaitingCharges;
         }
         return baseState;
     }

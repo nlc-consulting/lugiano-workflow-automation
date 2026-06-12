@@ -108,6 +108,14 @@ public interface IPatientDetailQueries
     // charge; patients absent from the dictionary have nothing outstanding.
     Task<IReadOnlyDictionary<int, OutstandingChargesSummary>> GetOutstandingChargesAsync(
         IEnumerable<int> patientIds);
+    // Insurance balance per patient — total still owed (unbilled charges +
+    // billed-not-yet-paid AR). Approximated as SUM(charges) - SUM(payments) -
+    // SUM(adjustments) which is mathematically the full account balance;
+    // accurate for Auto/PIP cases where the patient owes nothing (the demo
+    // path). For self-pay or post-EOB residuals this also includes the
+    // patient side — track via task #54 for a proper split.
+    Task<IReadOnlyDictionary<int, decimal>> GetInsuranceBalancesAsync(
+        IEnumerable<int> patientIds);
     // Visits (Appointments) for a single patient where at least one service
     // charge has not yet been billed. Used by the scrubber to scope the note
     // bundle and DX list to exactly what's about to bill — no patient-wide
@@ -394,6 +402,45 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
                     Count: g.Count(),
                     TotalAmount: g.Sum(r => r.Amount),
                     OldestChargeDate: g.Min(r => r.TranDate)));
+    }
+
+    public async Task<IReadOnlyDictionary<int, decimal>> GetInsuranceBalancesAsync(
+        IEnumerable<int> patientIds)
+    {
+        var ids = patientIds.Distinct().ToList();
+        if (ids.Count == 0)
+            return new Dictionary<int, decimal>();
+
+        await using var conn = _sourceDb.Create();
+        // Each charge row tracks paid + adjusted amounts directly on its
+        // record. Per-charge balance = TranAmt minus everything that's been
+        // applied. Uses Transactions.PatID directly (NOT Appointments.PatientID
+        // via JOIN) — avoids dropping rows without an ApptID. Validated
+        // against ChiroTouch ledger footer for Shawn Willoughby: this returns
+        // $88,515 vs CT's $88,370 (~0.16% off — one re-exam line, likely
+        // special CT handling — chase via task #54).
+        const string sql =
+            """
+            SELECT PatID AS PatientId,
+                   COALESCE(SUM(
+                     TranAmt
+                     - ISNULL(PriPaidAmt,        0)
+                     - ISNULL(SecPaidAmt,        0)
+                     - ISNULL(PatPaidAmt,        0)
+                     - ISNULL(WOAmt,             0)
+                     - ISNULL(DiscountAmt,       0)
+                     - ISNULL(PatientAdjustment, 0)
+                     - ISNULL(PatientOther,      0)
+                   ), 0) AS Balance
+            FROM   dbo.Transactions
+            WHERE  PatID IN @ids
+              AND  TranType    = 'C'
+              AND  TranSubType = 'SV'
+            GROUP BY PatID;
+            """;
+
+        var rows = await conn.QueryAsync<(int PatientId, decimal Balance)>(sql, new { ids });
+        return rows.ToDictionary(r => r.PatientId, r => r.Balance);
     }
 
     public async Task<IReadOnlyList<UnbilledVisit>> GetUnbilledVisitsAsync(int patientId)

@@ -72,9 +72,40 @@ public sealed class ScrubReviewController : ControllerBase
                 .Where(c => caseIds.Contains(c.Id))
                 .ToDictionaryAsync(c => c.Id);
 
+        // Pre-fetch the failing notes' plain text + authoring doctor so the
+        // Doctor View modal can show the original to edit in-place, and the
+        // queue list can surface "this would be sent to Dr. X" (admins see
+        // every row, but real doctor portal scoping is task #40).
+        var noteIds = page.Select(s => s.NoteId).Distinct().ToList();
+        var noteInfoById = noteIds.Count == 0
+            ? new Dictionary<int, (string? PlainText, int? DoctorId)>()
+            : (await db.DoctorNotes.AsNoTracking()
+                .Where(n => noteIds.Contains(n.Id))
+                .Select(n => new { n.Id, n.PlainText, n.DoctorId })
+                .ToListAsync())
+                .ToDictionary(n => n.Id, n => (n.PlainText, n.DoctorId));
+
+        // Map ChiroTouch doctor ids -> names via our Doctor table. Doctor.ChiroTouchDoctorId
+        // is the bridge column; FullName is "First Last, Credential".
+        var ctDoctorIds = noteInfoById.Values
+            .Select(v => v.DoctorId)
+            .Where(d => d.HasValue)
+            .Select(d => d!.Value)
+            .Distinct()
+            .ToList();
+        var doctorNameByCtId = ctDoctorIds.Count == 0
+            ? new Dictionary<int, string>()
+            : await db.Doctors.AsNoTracking()
+                .Where(d => ctDoctorIds.Contains(d.ChiroTouchDoctorId))
+                .ToDictionaryAsync(d => d.ChiroTouchDoctorId, d => d.FullName ?? string.Empty);
+
         var rows = page.Select(s =>
         {
             casesById.TryGetValue(s.WorkflowCaseId, out var c);
+            noteInfoById.TryGetValue(s.NoteId, out var info);
+            string? doctor = null;
+            if (info.DoctorId.HasValue && doctorNameByCtId.TryGetValue(info.DoctorId.Value, out var name))
+                doctor = name;
             return new
             {
                 id = c?.PatientId ?? 0,
@@ -88,6 +119,14 @@ public sealed class ScrubReviewController : ControllerBase
                 // as originalDoctorNoteId on submit so the PSChiro writeback
                 // anchors to the correct visit's date + doctor.
                 doctorNoteId = s.NoteId,
+                // Original note text pre-fills the modal's textarea so the
+                // doctor edits in place rather than re-authoring from scratch.
+                // Plain text — RTF formatting was already stripped on sync;
+                // the writeback re-wraps in minimal RTF for TX_RTF32.
+                originalText = info.PlainText,
+                // Authoring doctor — surfaced so admins can see whose queue
+                // this would be in once portal logins are scoped (task #40).
+                doctor,
             };
         }).ToList();
 

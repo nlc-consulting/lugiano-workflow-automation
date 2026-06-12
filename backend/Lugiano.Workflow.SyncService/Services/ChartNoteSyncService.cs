@@ -121,33 +121,29 @@ public sealed class ChartNoteSyncService
                 // entry or a corrected one).
                 await _corrections.ResolveOpenForPatientAsync(note.PatientId, ct);
 
-                // Auto-scrub policy: when a new chart note arrives, scrub
-                // THAT specific note against its visit's DX + charges.
-                // Gate to avoid wasted runs: skip if the patient's last scrub
-                // was a Pass (chart already clean) — fail/no-prior triggers
-                // the scrub. Scrub errors are logged but never break the sync
-                // cycle — sync's job is to capture state.
-                if (await _scrubs.ShouldAutoScrubAsync(caseId, ct))
+                // Auto-scrub policy: every new DoctorNote gets its own scrub.
+                // Per-note model — older notes' verdicts no longer gate newer
+                // ones. The gate's only job now is idempotency (a re-run of
+                // sync that re-encounters the same note doesn't double-scrub).
+                // Scrub errors are logged but never break the sync cycle —
+                // sync's job is to capture state.
+                try
                 {
-                    try
+                    var doctorNoteId = await _cases.GetDoctorNoteIdByChartNoteIdAsync(note.Id);
+                    if (doctorNoteId.HasValue
+                        && await _scrubs.ShouldAutoScrubAsync(doctorNoteId.Value, ct))
                     {
-                        // Find the DoctorNote.Id we just stored for this
-                        // ChartNotes row.
-                        var doctorNoteId = await _cases.GetDoctorNoteIdByChartNoteIdAsync(note.Id);
-                        if (doctorNoteId.HasValue)
-                        {
-                            var result = await _scrubs.RunForNoteAsync(doctorNoteId.Value, ct);
-                            _logger.LogInformation(
-                                "ChartNotes: auto-scrubbed note {NoteId} (case {CaseId}, patient {PatientId}) -> {Verdict}.",
-                                doctorNoteId.Value, caseId, note.PatientId, result.Verdict);
-                        }
+                        var result = await _scrubs.RunForNoteAsync(doctorNoteId.Value, ct);
+                        _logger.LogInformation(
+                            "ChartNotes: auto-scrubbed note {NoteId} (case {CaseId}, patient {PatientId}) -> {Verdict}.",
+                            doctorNoteId.Value, caseId, note.PatientId, result.Verdict);
                     }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex,
-                            "ChartNotes: auto-scrub failed for note {NoteId} (case {CaseId}); continuing sync.",
-                            note.Id, caseId);
-                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "ChartNotes: auto-scrub failed for note {NoteId} (case {CaseId}); continuing sync.",
+                        note.Id, caseId);
                 }
 
                 if (note.Id > maxProcessedId)

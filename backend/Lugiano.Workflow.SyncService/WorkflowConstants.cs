@@ -14,6 +14,11 @@ public static class WorkflowStates
     // at read-time in CasesController.GetCases (not stored on WorkflowCase)
     // until we refactor state to per-appointment.
     public const string ReadyForBilling = "ReadyForBilling";
+    // Insurance + notes + passing scrub all in place, but no unbilled charges
+    // sitting on the chart yet — we're waiting for the front-desk / billing
+    // entry to land the CPT lines. A charges-arrived trigger advances this
+    // to ReadyForBilling automatically (task #29).
+    public const string AwaitingCharges = "AwaitingCharges";
 }
 
 // Lifecycle of a single CorrectionRequest. Pending = created but not yet

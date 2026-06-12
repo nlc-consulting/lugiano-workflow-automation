@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Lugiano.Workflow.SyncService.Services.Scrubbing;
+using Lugiano.Workflow.SyncService.Workflow;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace Lugiano.Workflow.SyncService.Controllers;
 
@@ -8,8 +10,15 @@ namespace Lugiano.Workflow.SyncService.Controllers;
 public sealed class ScrubController : ControllerBase
 {
     private readonly ScrubOrchestrator _orchestrator;
+    private readonly IDbContextFactory<WorkflowDbContext> _dbFactory;
 
-    public ScrubController(ScrubOrchestrator orchestrator) => _orchestrator = orchestrator;
+    public ScrubController(
+        ScrubOrchestrator orchestrator,
+        IDbContextFactory<WorkflowDbContext> dbFactory)
+    {
+        _orchestrator = orchestrator;
+        _dbFactory = dbFactory;
+    }
 
     // POST /notes/{doctorNoteId}/scrub — run a per-note scrub. The note's
     // visit defines DX + charges scope; brief chart context rides along.
@@ -64,6 +73,82 @@ public sealed class ScrubController : ControllerBase
     }
 
     public sealed record OverrideRequest(string Verdict, string? OverriddenBy, string? Reason);
+
+    // POST /scrub/backfill-latest?dryRun=true&topN=50 — fills in scrub results
+    // for the latest DoctorNote per case where that note has no scrub yet.
+    // Bounded by topN (oldest-updated cases first) so cost is predictable.
+    // dryRun=true returns identified counts without firing Claude.
+    // Sequential execution — predictable load on the Anthropic API and easy
+    // to interrupt. Re-run to pick up cases that errored.
+    [HttpPost("scrub/backfill-latest")]
+    public async Task<IActionResult> BackfillLatest(
+        [FromQuery] bool dryRun = true,
+        [FromQuery] int topN = 50,
+        CancellationToken ct = default)
+    {
+        topN = Math.Clamp(topN, 1, 200);
+
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+
+        // Pull all notes for cases-of-interest, group in memory (EF Core 8
+        // can't translate g.OrderBy().First() projections). Cheap — note
+        // count is bounded by total cases × ~50 history per case.
+        var allNotes = await db.DoctorNotes.AsNoTracking()
+            .Select(n => new { n.Id, n.WorkflowCaseId, n.NoteDate })
+            .ToListAsync(ct);
+
+        var latestPerCase = allNotes
+            .GroupBy(n => n.WorkflowCaseId)
+            .Select(g => g.OrderByDescending(n => n.NoteDate).ThenByDescending(n => n.Id).First())
+            .Select(n => n.Id)
+            .ToHashSet();
+
+        // Note ids with at least one ScrubResult — skip those.
+        var scrubbedNoteIds = await db.ScrubResults.AsNoTracking()
+            .Where(s => s.DoctorNoteId != null)
+            .Select(s => s.DoctorNoteId!.Value)
+            .Distinct()
+            .ToListAsync(ct);
+        var scrubbedSet = scrubbedNoteIds.ToHashSet();
+
+        var candidates = latestPerCase.Where(id => !scrubbedSet.Contains(id)).Take(topN).ToList();
+
+        if (dryRun)
+        {
+            return Ok(new
+            {
+                dryRun = true,
+                identified = candidates.Count,
+                topN,
+                exampleNoteIds = candidates.Take(10).ToList(),
+            });
+        }
+
+        var scrubbed = 0;
+        var errors = new List<object>();
+        foreach (var noteId in candidates)
+        {
+            if (ct.IsCancellationRequested) break;
+            try
+            {
+                await _orchestrator.RunForNoteAsync(noteId, ct);
+                scrubbed++;
+            }
+            catch (Exception ex)
+            {
+                errors.Add(new { noteId, error = ex.Message });
+            }
+        }
+
+        return Ok(new
+        {
+            dryRun = false,
+            identified = candidates.Count,
+            scrubbed,
+            errorCount = errors.Count,
+            errors,
+        });
+    }
 
     private static object Project(Lugiano.Workflow.SyncService.Workflow.Models.ScrubResult r) => new
     {
