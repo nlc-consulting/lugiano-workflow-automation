@@ -16,7 +16,7 @@ import {
 } from '@mui/material'
 import ReplyAll from '@mui/icons-material/ReplyAll'
 import SectionCard from './SectionCard'
-import { formatVisitTime } from './formatters'
+import { formatShortDate, formatVisitTime } from './formatters'
 import KickbackModal from '../KickbackModal'
 import ScrubPanel from '../ScrubPanel'
 
@@ -192,11 +192,10 @@ const NotesAndDiagnosesCard = () => {
                 sx={{ borderBottom: 1, borderColor: 'divider' }}
               >
                 {notes.map((n) => {
-                  const dateStr = n.noteDate
-                    ? new Date(n.noteDate).toLocaleDateString('en-US', {
-                        timeZone: 'America/New_York',
-                      })
-                    : `Note ${Math.abs(n.id)}`
+                  // Clinical date — server emits as "yyyy-MM-dd" so the
+                  // formatter renders the calendar day directly (no EDT
+                  // midnight-UTC shift). Falls back to "Note N" when missing.
+                  const dateStr = formatShortDate(n.noteDate) ?? `Note ${Math.abs(n.id)}`
                   const verdict = n.latestScrub?.verdict
                   const verdictDot = verdict ? (
                     <Box
@@ -321,13 +320,7 @@ const NotesAndDiagnosesCard = () => {
           onClose={() => setKickbackOpen(false)}
           patientId={(record?.patientId as number) ?? 0}
           chartNoteId={currentNote.id}
-          noteDateLabel={
-            currentNote.noteDate
-              ? new Date(currentNote.noteDate).toLocaleDateString('en-US', {
-                  timeZone: 'America/New_York',
-                })
-              : `Note ${currentNote.id}`
-          }
+          noteDateLabel={formatShortDate(currentNote.noteDate) ?? `Note ${currentNote.id}`}
           onSent={(msg) => {
             notify(msg, { type: 'success' })
             refresh()

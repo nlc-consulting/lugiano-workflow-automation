@@ -61,13 +61,10 @@ export const AppAdmin = () => (
     loginPage={Login}
     title="Lugiano Portal"
   >
-    {/* Live PSChiro lookup. No show route here — clicks navigate to /cases/{id}/show. */}
-    <Resource
-      name="patients"
-      list={PatientList}
-      icon={PersonSearch}
-      options={{ label: 'Patients' }}
-    />
+    {/* Sidebar order mirrors the workflow lifecycle: Workflow dashboard first
+        (the operator's home view), then the two human-touch queues (Doctor
+        View → Human Review), then supporting tools (Patients lookup, EOB
+        preview), then admin (Users). */}
     <Resource
       name="cases"
       list={CaseList}
@@ -89,6 +86,13 @@ export const AppAdmin = () => (
       list={HumanReviewList}
       icon={Gavel}
       options={{ label: 'Human Review' }}
+    />
+    {/* Live PSChiro lookup. No show route here — clicks navigate to /cases/{id}/show. */}
+    <Resource
+      name="patients"
+      list={PatientList}
+      icon={PersonSearch}
+      options={{ label: 'Patients' }}
     />
     {/* EOB posting preview. Not a CRUD resource — the "list" is the upload
         + preview page itself. Read-only — no writeback to PSChiro yet. */}

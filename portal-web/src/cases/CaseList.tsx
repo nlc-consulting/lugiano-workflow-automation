@@ -11,6 +11,7 @@ import { Box, Chip, Tooltip, Typography } from '@mui/material'
 // Re-enable by restoring the import and the <VerifyPipButton /> column below.
 // import VerifyPipButton from './VerifyPipButton'
 import EstDateTimeField from './EstDateTimeField'
+import { formatShortDate } from './components/formatters'
 
 type CaseRecord = RaRecord & {
   firstName?: string
@@ -20,6 +21,7 @@ type CaseRecord = RaRecord & {
   outstandingChargesCount?: number
   outstandingChargesTotal?: number
   oldestOutstandingChargeDate?: string | null
+  lastNoteDate?: string | null
 }
 
 const SCRUB_LABELS: Record<string, string> = {
@@ -111,7 +113,13 @@ const CaseList = () => (
         render={(r: CaseRecord) => `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim()}
       />
       <BooleanField source="insuranceProvided" label="Insurance" />
-      <EstDateTimeField source="lastNoteDate" label="Last note" />
+      {/* Clinical date — render without time component so a midnight-UTC date
+          doesn't shift to "previous day 8 PM EDT". */}
+      <FunctionField
+        label="Last note"
+        sortBy="lastNoteDate"
+        render={(r: CaseRecord) => formatShortDate(r.lastNoteDate) ?? '—'}
+      />
       {/* PIP verified column parked alongside the action button — re-enable together. */}
       {/* <BooleanField source="pipVerified" label="PIP Verified" /> */}
       <FunctionField
