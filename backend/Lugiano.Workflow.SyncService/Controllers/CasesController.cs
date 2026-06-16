@@ -47,18 +47,22 @@ public sealed class CasesController : ControllerBase
     // GET /cases — dashboard: the portal's workflow record, newest-first, with per-flow stamps.
     // ra-data-simple-rest: ?range=[start,end] + Content-Range header.
     [HttpGet]
-    public async Task<IActionResult> GetCases([FromQuery] string? range)
+    public async Task<IActionResult> GetCases([FromQuery] string? range, [FromQuery] string? sort)
     {
         var (skip, take) = ParseRange(range);
         if (take <= 0 || take > 200) take = 25;
+        var (sortField, sortDesc) = ParseSort(sort);
 
         await using var db = await _factory.CreateDbContextAsync();
         var total = await db.WorkflowCases.CountAsync();
 
-        var cases = await db.WorkflowCases.AsNoTracking()
-            .OrderByDescending(c => c.UpdatedAt)
-            .Skip(skip).Take(take)
-            .ToListAsync();
+        // Load ALL cases — several visible columns (LastNoteDate, insurance
+        // balance, latest scrub) are computed from joined data, so we can't
+        // sort + paginate at the SQL level without denormalizing those onto
+        // WorkflowCase. With ~700 cases the in-memory sort is sub-millisecond.
+        // When this becomes a problem, pre-compute the joined fields on the
+        // WorkflowCase row (or move pagination to a SQL view).
+        var cases = await db.WorkflowCases.AsNoTracking().ToListAsync();
 
         var caseIds = cases.Select(c => c.Id).ToList();
         var patientIds = cases.Select(c => c.PatientId).ToList();
@@ -150,13 +154,80 @@ public sealed class CasesController : ControllerBase
                 // chip reads it as "what insurance owes us total".
                 OutstandingChargesTotal: insuranceBalance,
                 OldestOutstandingChargeDate: outstanding?.OldestChargeDate,
-                LastNoteDate: latestNotePerCase.GetValueOrDefault(c.Id)?.NoteDate
-                              ?? c.DoctorNotesReceivedAt);
+                // Clinical calendar date — emit as date-only "yyyy-MM-dd" so
+                // the client doesn't interpret midnight-UTC as the previous
+                // evening in EDT. The dashboard formatter (formatShortDate)
+                // detects this shape and renders without timezone shift.
+                LastNoteDate: (latestNotePerCase.GetValueOrDefault(c.Id)?.NoteDate
+                              ?? c.DoctorNotesReceivedAt)?.ToString("yyyy-MM-dd"));
         }).ToList();
 
-        var last = total == 0 ? 0 : Math.Min(skip + rows.Count - 1, total - 1);
+        rows = ApplySort(rows, sortField, sortDesc);
+
+        // Paginate after sort — react-admin's range is over the sorted result.
+        var page = rows.Skip(skip).Take(take).ToList();
+        var last = total == 0 ? 0 : Math.Min(skip + page.Count - 1, total - 1);
         Response.Headers["Content-Range"] = $"cases {skip}-{last}/{total}";
-        return Ok(rows);
+        return Ok(page);
+    }
+
+    // react-admin ra-data-simple-rest sends sort as ?sort=["field","ORDER"].
+    // Returns (field, desc). Defaults to LastUpdatedAt DESC when missing/bad.
+    private static (string Field, bool Desc) ParseSort(string? sort)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(sort))
+            {
+                var a = JsonSerializer.Deserialize<string[]>(sort);
+                if (a is { Length: 2 })
+                    return (a[0] ?? string.Empty, string.Equals(a[1], "DESC", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+        catch { /* fall through to default */ }
+        return ("lastUpdatedAt", true);
+    }
+
+    // Sort the dashboard rows by the requested field. Unknown fields fall back
+    // to LastUpdatedAt — never throw, just keep the dashboard responsive.
+    // Null values sort last regardless of direction (so "Scrub pending" /
+    // "All paid" rows don't crowd the top when sorting on those columns).
+    private static List<CaseDto> ApplySort(List<CaseDto> rows, string field, bool desc)
+    {
+        // Explicit nullable casts on non-nullable value-type fields so C#
+        // overload resolution picks the struct-key Order helper.
+        IOrderedEnumerable<CaseDto> sorted = field.ToLowerInvariant() switch
+        {
+            "patientid"               => Order(rows, r => (int?)r.PatientId, desc),
+            "lastname"                => Order(rows, r => r.LastName, desc),
+            "firstname"               => Order(rows, r => r.FirstName, desc),
+            "insuranceprovided"       => Order(rows, r => (bool?)r.InsuranceProvided, desc),
+            "lastnotedate"            => Order(rows, r => r.LastNoteDate, desc),
+            "latestscrubat"           => Order(rows, r => r.LatestScrubAt, desc),
+            "outstandingchargestotal" => Order(rows, r => (decimal?)r.OutstandingChargesTotal, desc),
+            "currentstate"            => Order(rows, r => r.CurrentState, desc),
+            "addedat"                 => Order(rows, r => (DateTime?)r.AddedAt, desc),
+            "lastupdatedat"           => Order(rows, r => (DateTime?)r.LastUpdatedAt, desc),
+            _                         => Order(rows, r => (DateTime?)r.LastUpdatedAt, true),
+        };
+        return sorted.ToList();
+    }
+
+    // Direction-aware ordering with nulls always at the bottom — for date /
+    // string columns where "missing" should never be confused with "extreme".
+    private static IOrderedEnumerable<CaseDto> Order<TKey>(
+        List<CaseDto> rows, Func<CaseDto, TKey?> keySelector, bool desc) where TKey : struct
+    {
+        return desc
+            ? rows.OrderBy(r => keySelector(r) == null).ThenByDescending(keySelector)
+            : rows.OrderBy(r => keySelector(r) == null).ThenBy(keySelector);
+    }
+    private static IOrderedEnumerable<CaseDto> Order(
+        List<CaseDto> rows, Func<CaseDto, string?> keySelector, bool desc)
+    {
+        return desc
+            ? rows.OrderBy(r => string.IsNullOrEmpty(keySelector(r))).ThenByDescending(keySelector)
+            : rows.OrderBy(r => string.IsNullOrEmpty(keySelector(r))).ThenBy(keySelector);
     }
 
     // GET /cases/{id} — patient detail (live ChiroTouch info + our per-flow stamps). id == PatientId.
@@ -270,7 +341,9 @@ public sealed class CasesController : ControllerBase
                 id = n.Id,
                 source = "chart",
                 doctorNoteId,
-                noteDate = n.NoteDate,
+                // Clinical date as "yyyy-MM-dd" — keeps the client from
+                // shifting midnight-UTC into the previous EDT evening.
+                noteDate = n.NoteDate?.ToString("yyyy-MM-dd"),
                 doctor = n.Doctor,
                 status = n.Status,
                 plainText = text,
@@ -331,7 +404,7 @@ public sealed class CasesController : ControllerBase
                     id = -p.Id,
                     source = "portal",
                     portalNoteId = p.Id,
-                    noteDate = p.NoteDate,
+                    noteDate = p.NoteDate?.ToString("yyyy-MM-dd"),
                     doctor = p.DoctorId.HasValue && doctorNamesByCtId.TryGetValue(p.DoctorId.Value, out var name)
                         ? name
                         : "Portal correction",
@@ -722,7 +795,7 @@ public record CaseDto(
     int OutstandingChargesCount,
     decimal OutstandingChargesTotal,
     DateTime? OldestOutstandingChargeDate,
-    // Most recent chart note's date — what the reviewer sees as "last touched
-    // clinically". Currently mirrors DoctorNotesReceivedAt (= max NoteDate
-    // we've stamped). Always show the most recent one in the main table.
-    DateTime? LastNoteDate);
+    // Most recent chart note's clinical date as "yyyy-MM-dd" — calendar date,
+    // not a timestamp. Emitting as a plain date string keeps the client from
+    // shifting it to the previous evening in EDT (midnight-UTC quirk).
+    string? LastNoteDate);
