@@ -1,5 +1,8 @@
 import { useRecordContext } from 'react-admin'
-import { Box, Card, CardContent, Chip, Typography } from '@mui/material'
+import { Box, Button, Card, CardContent, Chip, Typography } from '@mui/material'
+import PictureAsPdf from '@mui/icons-material/PictureAsPdf'
+
+const WORKFLOW_API = import.meta.env.VITE_WORKFLOW_API_URL || '/workflow-api'
 
 // Workflow state → label + MUI chip color. Single place to extend when new
 // states land (scrub-related ones in the next epic).
@@ -92,6 +95,9 @@ const PatientHeader = () => {
               </Typography>
             )}
           </Box>
+          {/* Notes PDF button removed — the per-DOS HCFA endpoint now bundles
+              the chart note alongside the form. The standalone /notes/preview
+              endpoint is still wired in case a full-history PDF is needed. */}
           <Chip
             color={stateColor(r.currentState)}
             label={stateLabel(r.currentState)}
