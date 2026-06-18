@@ -50,6 +50,8 @@ builder.Services.AddSingleton<IDoctorReadQueries, DoctorReadQueries>();
 builder.Services.AddSingleton<ISourceDbWriteConnectionFactory, SourceDbWriteConnectionFactory>();
 builder.Services.AddSingleton<IPSChiroWriteService, PSChiroWriteService>();
 builder.Services.AddSingleton<EobPreviewService>();
+builder.Services.AddSingleton<HcfaPreviewService>();
+builder.Services.AddSingleton<NotesPreviewService>();
 
 builder.Services.AddSingleton<SyncStateService>();
 builder.Services.AddSingleton<WorkflowCaseService>();

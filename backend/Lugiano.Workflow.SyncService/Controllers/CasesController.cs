@@ -645,6 +645,16 @@ public sealed class CasesController : ControllerBase
         {
             try
             {
+                // Respect the master kill-switch — when AutoScrub is disabled
+                // (cost control), the corrected note stays as "Scrub pending"
+                // until the operator manually fires it.
+                if (!scrubs.AutoScrubEnabled)
+                {
+                    logger.LogInformation(
+                        "Post-correction re-scrub skipped for note {NoteId}: Scrubbing:AutoScrub=false.",
+                        noteIdForScrub);
+                    return;
+                }
                 await scrubs.RunForNoteAsync(noteIdForScrub, CancellationToken.None);
             }
             catch (Exception ex)

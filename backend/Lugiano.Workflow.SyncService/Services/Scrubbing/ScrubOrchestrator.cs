@@ -23,19 +23,28 @@ public sealed class ScrubOrchestrator
     private readonly IDbContextFactory<WorkflowDbContext> _dbFactory;
     private readonly IPatientDetailQueries _detail;
     private readonly IScrubber _scrubber;
+    private readonly IConfiguration _config;
     private readonly ILogger<ScrubOrchestrator> _logger;
 
     public ScrubOrchestrator(
         IDbContextFactory<WorkflowDbContext> dbFactory,
         IPatientDetailQueries detail,
         IScrubber scrubber,
+        IConfiguration config,
         ILogger<ScrubOrchestrator> logger)
     {
         _dbFactory = dbFactory;
         _detail = detail;
         _scrubber = scrubber;
+        _config = config;
         _logger = logger;
     }
+
+    // Master kill-switch for automatic Claude calls. Manual /notes/{id}/scrub
+    // is unaffected — operator-initiated scrubs always run. Used to cap demo
+    // costs while still letting the operator fire specific cases on demand.
+    public bool AutoScrubEnabled =>
+        _config.GetValue("Scrubbing:AutoScrub", true);
 
     // Run a per-note scrub. The note's visit defines the DX + charges scope;
     // a few prior notes ride along as brief chart context. Result is keyed to
@@ -142,9 +151,17 @@ public sealed class ScrubOrchestrator
     // Auto-scrub gate: per-NOTE, not per-case. Each new DoctorNote is its own
     // evaluation unit (per-note scrubbing) — a prior Pass on an older note no
     // longer means the new note can be skipped. Returns true unless this
-    // specific note already has a scrub (idempotency safety for sync re-runs).
+    // specific note already has a scrub (idempotency safety for sync re-runs),
+    // OR auto-scrubbing is disabled via config (Scrubbing:AutoScrub=false).
     public async Task<bool> ShouldAutoScrubAsync(int doctorNoteId, CancellationToken ct = default)
     {
+        if (!AutoScrubEnabled)
+        {
+            _logger.LogInformation(
+                "Auto-scrub skipped for note {NoteId}: Scrubbing:AutoScrub=false in config.",
+                doctorNoteId);
+            return false;
+        }
         await using var db = await _dbFactory.CreateDbContextAsync(ct);
         var alreadyScrubbed = await db.ScrubResults
             .AsNoTracking()
