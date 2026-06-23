@@ -13,7 +13,9 @@ public sealed class TestController : ControllerBase
     private readonly IPSChiroWriteService _pschiroWrite;
     private readonly ILogger<TestController> _logger;
 
-    public TestController(IPSChiroWriteService pschiroWrite, ILogger<TestController> logger)
+    public TestController(
+        IPSChiroWriteService pschiroWrite,
+        ILogger<TestController> logger)
     {
         _pschiroWrite = pschiroWrite;
         _logger = logger;

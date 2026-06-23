@@ -246,10 +246,18 @@ public sealed class EobPreviewService
         return result;
     }
 
-    private static string NormalizeName(string? raw) =>
-        string.IsNullOrWhiteSpace(raw)
-            ? string.Empty
-            : string.Join(' ', raw.Trim().ToUpperInvariant().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    private static string NormalizeName(string? raw)
+    {
+        // EOB workbooks frequently use "Last, First" with a comma; PSChiro
+        // stores First/Last as separate columns we concatenate with a space.
+        // Strip punctuation (commas, periods, hyphens) to a single space
+        // before collapsing whitespace so both orderings normalize to the
+        // same shape ("TEST FAKEE" or "FAKEE TEST" — caller indexes both).
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        var cleaned = new string(raw.Select(c => char.IsLetterOrDigit(c) ? c : ' ').ToArray());
+        return string.Join(' ', cleaned.ToUpperInvariant()
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    }
 }
 
 public sealed record EobLine(

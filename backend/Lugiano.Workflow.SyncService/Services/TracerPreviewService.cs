@@ -89,18 +89,28 @@ public sealed class TracerPreviewService
             new { patientId, billedDate = billedDate.Date });
         if (header is null) return null;
 
-        // Patient-level diagnoses (any DX on any of the patient's appointments).
-        // CT's tracer shows the diagnosis list at the case level, not per claim.
+        // Diagnoses scoped to the appointments in THIS billed batch only —
+        // matches CT's tracer behavior (which shows only the DXs attached
+        // to the visits being traced, not the patient's lifetime DX history).
+        // The inner subquery is the exact same shape as
+        // GetAppointmentIdsForBatchAsync so the two stay in lockstep.
         var diagnoses = (await conn.QueryAsync<TracerDx>(
             """
             SELECT DISTINCT d.Code, d.Description
             FROM   dbo.Diagnoses d
-            JOIN   dbo.Appointments a ON a.ID = d.AppointmentID
-            WHERE  a.PatientID = @patientId
+            WHERE  d.AppointmentID IN (
+                SELECT DISTINCT t.ApptID
+                FROM   dbo.BilledCharges bc
+                JOIN   dbo.Transactions  t ON t.ID = bc.ChargeTranID
+                WHERE  t.PatID       = @patientId
+                  AND  CAST(bc.BilledDate AS date) = @billedDate
+                  AND  bc.PaidDate IS NULL
+                  AND  t.ApptID IS NOT NULL
+            )
               AND  d.Code IS NOT NULL AND d.Code <> ''
             ORDER BY d.Code;
             """,
-            new { patientId })).ToList();
+            new { patientId, billedDate = billedDate.Date })).ToList();
 
         // Charge lines — DOS, injury date, CPT, description, amount. Injury
         // date comes from Patients.CurInjuryDate (one per patient for the

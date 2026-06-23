@@ -18,6 +18,7 @@ import ReplyAll from '@mui/icons-material/ReplyAll'
 
 import SectionCard from './SectionCard'
 import HcfaSplitButton from './HcfaSplitButton'
+import BillNowButton from './BillNowButton'
 import { formatShortDate, formatVisitTime } from './formatters'
 import KickbackModal from '../KickbackModal'
 import ScrubPanel from '../ScrubPanel'
@@ -262,10 +263,16 @@ const NotesAndDiagnosesCard = () => {
                         <>
                           {renderVisitChip(currentNote)}
                           {currentNote.visitId != null && (
-                            <HcfaSplitButton
-                              patientId={(record?.patientId as number) ?? 0}
-                              visitId={currentNote.visitId}
-                            />
+                            <>
+                              <HcfaSplitButton
+                                patientId={(record?.patientId as number) ?? 0}
+                                visitId={currentNote.visitId}
+                              />
+                              <BillNowButton
+                                patientId={(record?.patientId as number) ?? 0}
+                                visitId={currentNote.visitId}
+                              />
+                            </>
                           )}
                           <Button
                             size="small"
