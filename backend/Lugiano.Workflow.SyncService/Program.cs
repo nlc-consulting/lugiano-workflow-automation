@@ -52,6 +52,7 @@ builder.Services.AddSingleton<IPSChiroWriteService, PSChiroWriteService>();
 builder.Services.AddSingleton<EobPreviewService>();
 builder.Services.AddSingleton<HcfaPreviewService>();
 builder.Services.AddSingleton<NotesPreviewService>();
+builder.Services.AddSingleton<TracerPreviewService>();
 
 builder.Services.AddSingleton<SyncStateService>();
 builder.Services.AddSingleton<WorkflowCaseService>();
@@ -88,6 +89,13 @@ builder.Services.AddHttpClient("anthropic", c =>
 });
 builder.Services.AddSingleton<IScrubber, ClaudeScrubber>();
 builder.Services.AddSingleton<ScrubOrchestrator>();
+
+// Documo cloud fax — typed HttpClient + options binding. Used by FaxService
+// to send HCFA + tracer PDFs straight to carrier fax inboxes.
+builder.Services.Configure<Lugiano.Workflow.SyncService.Services.Fax.DocumoOptions>(
+    builder.Configuration.GetSection("Documo"));
+builder.Services.AddHttpClient<Lugiano.Workflow.SyncService.Services.Fax.DocumoFaxClient>();
+builder.Services.AddScoped<Lugiano.Workflow.SyncService.Services.Fax.FaxService>();
 
 // Background poller (ChiroTouch -> WorkflowAutomation), runs alongside the HTTP API.
 builder.Services.AddHostedService<Worker>();
