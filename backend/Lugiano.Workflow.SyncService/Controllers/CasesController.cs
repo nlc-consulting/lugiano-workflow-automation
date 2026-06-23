@@ -130,6 +130,12 @@ public sealed class CasesController : ControllerBase
         var insuranceByPatient = _detail.IsConfigured
             ? await _detail.GetInsuranceBalancesAsync(patientIds)
             : new Dictionary<int, decimal>();
+        // Team identifies patients by AccountNo, not the internal Patients.ID.
+        // Pulled in batch and surfaced on the dashboard alongside the PK so
+        // both stay clickable while staff learn the new portal.
+        var accountByPatient = _detail.IsConfigured
+            ? await _detail.GetAccountNumbersAsync(patientIds)
+            : new Dictionary<int, int>();
 
         var rows = cases.Select(c =>
         {
@@ -159,7 +165,12 @@ public sealed class CasesController : ControllerBase
                 // evening in EDT. The dashboard formatter (formatShortDate)
                 // detects this shape and renders without timezone shift.
                 LastNoteDate: (latestNotePerCase.GetValueOrDefault(c.Id)?.NoteDate
-                              ?? c.DoctorNotesReceivedAt)?.ToString("yyyy-MM-dd"));
+                              ?? c.DoctorNotesReceivedAt)?.ToString("yyyy-MM-dd"),
+                // Latest note's DoctorNote.Id — exposed so the dashboard's
+                // "Scrub now" button can fire POST /notes/{id}/scrub for the
+                // most recent note when auto-scrub is paused for cost control.
+                LatestDoctorNoteId: latestNotePerCase.GetValueOrDefault(c.Id)?.NoteId,
+                AccountNo: accountByPatient.TryGetValue(c.PatientId, out var acct) ? acct : (int?)null);
         }).ToList();
 
         rows = ApplySort(rows, sortField, sortDesc);
@@ -199,6 +210,7 @@ public sealed class CasesController : ControllerBase
         IOrderedEnumerable<CaseDto> sorted = field.ToLowerInvariant() switch
         {
             "patientid"               => Order(rows, r => (int?)r.PatientId, desc),
+            "accountno"               => Order(rows, r => r.AccountNo, desc),
             "lastname"                => Order(rows, r => r.LastName, desc),
             "firstname"               => Order(rows, r => r.FirstName, desc),
             "insuranceprovided"       => Order(rows, r => (bool?)r.InsuranceProvided, desc),
@@ -358,6 +370,9 @@ public sealed class CasesController : ControllerBase
                 diagnoses = n.VisitId is int vid && diagnosesByVisit.TryGetValue(vid, out var dx)
                     ? dx
                     : new List<object>(),
+                // Pre-formatted to the stored (clinic-local) wall clock so it mirrors
+                // ChiroTouch's "Signed: …" line exactly — no timezone re-shift client-side.
+                signedAt = n.SignedAt?.ToString("M/d/yyyy h:mm tt", CultureInfo.InvariantCulture),
                 // Per-tab ScrubPanel reads this inline — no follow-up fetch.
                 latestScrub = ScrubProj(doctorNoteId),
             }));
@@ -505,6 +520,7 @@ public sealed class CasesController : ControllerBase
             primaryDoctor = demo.PrimaryDoctor,
             caseType = demo.CaseType,
             curInjuryDate = demo.CurInjuryDate,
+            accountNo = demo.AccountNo,
             currentState = state,
             insuranceProvided = insurance,
             doctorNotesReceived = hasNotes,
@@ -808,4 +824,12 @@ public record CaseDto(
     // Most recent chart note's clinical date as "yyyy-MM-dd" — calendar date,
     // not a timestamp. Emitting as a plain date string keeps the client from
     // shifting it to the previous evening in EDT (midnight-UTC quirk).
-    string? LastNoteDate);
+    string? LastNoteDate,
+    // Internal DoctorNote.Id of the latest note (drives the manual "Scrub now"
+    // button on rows where verdict is pending). Null when the case has no
+    // notes yet.
+    int? LatestDoctorNoteId,
+    // PSChiro AccountNo — the human-facing ID the team uses to identify
+    // patients. Surfaced on the dashboard alongside the internal Patients.ID
+    // so staff aren't forced to memorize new keys.
+    int? AccountNo);

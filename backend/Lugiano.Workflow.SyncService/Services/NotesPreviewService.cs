@@ -1,5 +1,6 @@
 using Dapper;
 using Lugiano.Workflow.SyncService.ChiroTouch;
+using Lugiano.Workflow.SyncService.Services.Pdf;
 using Lugiano.Workflow.SyncService.Util;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
@@ -60,13 +61,23 @@ public sealed class NotesPreviewService
                 .GroupBy(d => d.AppointmentId)
                 .ToDictionary(g => g.Key, g => g.Select(d => $"{d.Code} {d.Description}").ToList());
 
+        // Signature image + signed timestamp per note, so the standalone notes
+        // PDF carries the same "Electronically Signed" block as the fax/HCFA flow.
+        var sigByNote = await GetSignaturesAsync(filtered.Select(n => n.Id).ToArray());
+
         var notes = new List<NotePageData>();
         foreach (var n in filtered)
         {
             string? text = null;
+            IReadOnlyList<IReadOnlyList<RtfRun>>? rich = null;
             if (n.SoapPtr is int ptr and not 0)
             {
-                try { text = RtfConverter.ToPlainText(await _noteReads.GetNoteRtfAsync(ptr)); }
+                try
+                {
+                    var rtf = await _noteReads.GetNoteRtfAsync(ptr);
+                    text = RtfConverter.ToPlainText(rtf);
+                    rich = RtfRichConverter.ToRuns(rtf);
+                }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Notes PDF: failed to read RTF for ptr {Ptr} (note {NoteId})", ptr, n.Id);
@@ -75,10 +86,26 @@ public sealed class NotesPreviewService
             var dxList = n.VisitId is int v && diagnosesByVisit.TryGetValue(v, out var list)
                 ? list
                 : new List<string>();
-            notes.Add(new NotePageData(n, text, dxList));
+            sigByNote.TryGetValue(n.Id, out var sig);
+            notes.Add(new NotePageData(n, text, dxList, rich, sig?.Image, sig?.SignedAt));
         }
 
         return new NotesPdfData(demo, policies, phoneNumber, notes);
+    }
+
+    private async Task<Dictionary<int, SigRow>> GetSignaturesAsync(int[] noteIds)
+    {
+        if (noteIds.Length == 0) return new Dictionary<int, SigRow>();
+        await using var conn = _sourceDb.Create();
+        return (await conn.QueryAsync<SigRow>(
+            """
+            SELECT SigTypeID AS NoteId, ImageBase64 AS Image, SigTimestamp AS SignedAt
+            FROM   dbo.Signatures
+            WHERE  SigType = 'CN'
+              AND  SigTypeID IN @noteIds
+              AND  ImageBase64 IS NOT NULL;
+            """,
+            new { noteIds })).ToDictionary(r => r.NoteId);
     }
 
     private async Task<string?> GetPrimaryPhoneAsync(int patientId)
@@ -187,70 +214,24 @@ public sealed class NotesPreviewService
                 });
             });
 
-            // -------- ONE PAGE PER NOTE --------
-            foreach (var note in data.Notes)
-            {
-                doc.Page(page =>
-                {
-                    page.Size(PageSizes.Letter);
-                    page.Margin(0.75f, Unit.Inch);
-                    page.DefaultTextStyle(t => t.FontSize(10).FontFamily(Fonts.Calibri));
+            // -------- ONE PAGE PER NOTE (shared ChiroTouch-matching renderer) --------
+            var ctx = new ChartNoteHeaderCtx(
+                PatientDisplayName: $"{demo.LastName}, {demo.FirstName}",
+                AccountNo: demo.PatientId.ToString(),
+                PatientBirthDate: null,
+                InsCoName: primaryPolicy?.Insurer,
+                PolicyNo: null,
+                InsuredId: null,
+                FacilityBlock: null);
 
-                    page.Header().Column(c =>
-                    {
-                        c.Item().Row(row =>
-                        {
-                            row.RelativeItem().Column(p =>
-                            {
-                                p.Item().Text(note.Row.NoteDate?.ToString("MMMM d, yyyy") ?? "Undated note")
-                                    .FontSize(15).Bold();
-                                p.Item().Text(t =>
-                                {
-                                    t.Span(note.Row.Doctor ?? "—").FontSize(10).Bold();
-                                    if (note.Row.VisitTime is DateTime vt)
-                                    {
-                                        t.Span("  ·  ").FontColor(Colors.Grey.Darken1);
-                                        t.Span(vt.ToString("h:mm tt")).FontSize(9);
-                                    }
-                                });
-                            });
-                            row.ConstantItem(180).AlignRight().Column(p =>
-                            {
-                                p.Item().Text($"{demo.LastName}, {demo.FirstName}").FontSize(9).Bold();
-                                p.Item().Text($"Acct {demo.PatientId}").FontSize(8).FontColor(Colors.Grey.Darken1);
-                            });
-                        });
-                        c.Item().PaddingVertical(6).LineHorizontal(1).LineColor(Colors.Grey.Medium);
-                    });
-
-                    page.Content().Column(c =>
-                    {
-                        // Diagnoses chip row
-                        if (note.Diagnoses.Count > 0)
-                        {
-                            c.Item().PaddingBottom(8).Text(t =>
-                            {
-                                t.Span("Diagnoses: ").FontSize(8).Bold().FontColor(Colors.Grey.Darken2);
-                                t.Span(string.Join("  ·  ", note.Diagnoses)).FontSize(9);
-                            });
-                        }
-
-                        // Body — preserve line breaks from PlainText
-                        c.Item().Text(note.PlainText ?? "(No note body available — RTF could not be read.)")
-                            .FontFamily(Fonts.Calibri).FontSize(10).LineHeight(1.35f);
-                    });
-
-                    page.Footer().AlignCenter().Text(t =>
-                    {
-                        t.Span($"{demo.LastName}, {demo.FirstName}  ·  ").FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.Span(note.Row.NoteDate?.ToString("MM/dd/yyyy") ?? "").FontSize(8).Bold().FontColor(Colors.Grey.Darken1);
-                        t.Span("  ·  ").FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.CurrentPageNumber().FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.Span(" / ").FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.TotalPages().FontSize(8).FontColor(Colors.Grey.Darken1);
-                    });
-                });
-            }
+            ChartNotesRenderer.AddNotePages(doc, ctx, data.Notes.Select(n => new RenderableNote(
+                NoteDate: n.Row.NoteDate,
+                ProviderName: n.Row.Doctor,
+                RichBody: n.RichBody,
+                PlainTextFallback: n.PlainText,
+                SignatureImageBase64: n.SignatureImageBase64,
+                SignedProviderName: n.Row.Doctor,
+                SignedAt: n.SignedAt)));
         }).GeneratePdf();
     }
 
@@ -270,7 +251,11 @@ public sealed class NotesPreviewService
         });
 }
 
-public sealed record NotePageData(ChartNoteRow Row, string? PlainText, List<string> Diagnoses);
+public sealed record NotePageData(
+    ChartNoteRow Row, string? PlainText, List<string> Diagnoses,
+    IReadOnlyList<IReadOnlyList<RtfRun>>? RichBody = null,
+    string? SignatureImageBase64 = null,
+    DateTime? SignedAt = null);
 
 public sealed record NotesPdfData(
     PatientDemographics Demographics,

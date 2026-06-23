@@ -19,7 +19,11 @@ public sealed record PatientDemographics(
     string? CaseType,
     // Accident / current-injury date for the active case. Source-of-truth for
     // "when did this case start" when surfacing the case context to reviewers.
-    DateTime? CurInjuryDate);
+    DateTime? CurInjuryDate,
+    // PSChiro AccountNo — the human-facing patient ID the team uses. Shown
+    // bold in the portal header so staff recognize patients by the same
+    // number that's printed on their CT records.
+    int? AccountNo);
 
 public sealed record InsurancePolicyRow(
     int Id,
@@ -56,7 +60,10 @@ public sealed record ChartNoteRow(
     DateTime? VisitCheckIn,
     DateTime? VisitCheckOut,
     string? VisitDoctor,
-    int VisitsSameDay);
+    int VisitsSameDay,
+    // When the note was signed (CN signature in dbo.Signatures). Null for the
+    // rare unsigned note. ChiroTouch shows this as the "Signed: …" line.
+    DateTime? SignedAt);
 
 public sealed record VisitDiagnosisRow(int AppointmentId, string Code, string? Description);
 
@@ -116,6 +123,11 @@ public interface IPatientDetailQueries
     // patient side — track via task #54 for a proper split.
     Task<IReadOnlyDictionary<int, decimal>> GetInsuranceBalancesAsync(
         IEnumerable<int> patientIds);
+    // PSChiro account numbers keyed by Patients.ID. Surfaced on the workflow
+    // dashboard because the team identifies patients by AccountNo, not the
+    // internal PK. Patients with NULL AccountNo are simply absent from the map.
+    Task<IReadOnlyDictionary<int, int>> GetAccountNumbersAsync(
+        IEnumerable<int> patientIds);
     // Visits (Appointments) for a single patient where at least one service
     // charge has not yet been billed. Used by the scrubber to scope the note
     // bundle and DX list to exactly what's about to bill — no patient-wide
@@ -155,7 +167,8 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
                    p.Zip           AS Zip,
                    d.FullName      AS PrimaryDoctor,
                    p.CaseType      AS CaseType,
-                   p.CurInjuryDate AS CurInjuryDate
+                   p.CurInjuryDate AS CurInjuryDate,
+                   p.AccountNo     AS AccountNo
             FROM   dbo.Patients p
             LEFT JOIN dbo.Doctors d ON d.ID = p.DoctorID
             WHERE  p.ID = @patientId;
@@ -281,7 +294,9 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
                    v.VisitDoctor      AS VisitDoctor,
                    (SELECT COUNT(*) FROM dbo.Appointments a2
                       WHERE a2.PatientID = cn.PatientID
-                        AND CAST(a2.ScheduleDateTime AS date) = CAST(cn.NoteDate AS date)) AS VisitsSameDay
+                        AND CAST(a2.ScheduleDateTime AS date) = CAST(cn.NoteDate AS date)) AS VisitsSameDay,
+                   (SELECT MIN(s.SigTimestamp) FROM dbo.Signatures s
+                      WHERE s.SigType = 'CN' AND s.SigTypeID = cn.ID) AS SignedAt
             FROM   dbo.ChartNotes cn
             LEFT JOIN dbo.Doctors d ON d.ID = cn.DoctorID
             OUTER APPLY (
@@ -441,6 +456,20 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
 
         var rows = await conn.QueryAsync<(int PatientId, decimal Balance)>(sql, new { ids });
         return rows.ToDictionary(r => r.PatientId, r => r.Balance);
+    }
+
+    public async Task<IReadOnlyDictionary<int, int>> GetAccountNumbersAsync(
+        IEnumerable<int> patientIds)
+    {
+        var ids = patientIds.Distinct().ToList();
+        if (ids.Count == 0) return new Dictionary<int, int>();
+
+        await using var conn = _sourceDb.Create();
+        var rows = await conn.QueryAsync<(int PatientId, int? AccountNo)>(
+            "SELECT ID AS PatientId, AccountNo FROM dbo.Patients WHERE ID IN @ids;",
+            new { ids });
+        return rows.Where(r => r.AccountNo.HasValue)
+                   .ToDictionary(r => r.PatientId, r => r.AccountNo!.Value);
     }
 
     public async Task<IReadOnlyList<UnbilledVisit>> GetUnbilledVisitsAsync(int patientId)

@@ -20,6 +20,12 @@ public sealed class ScrubController : ControllerBase
         _dbFactory = dbFactory;
     }
 
+    // GET /scrubbing/config — expose the AutoScrub kill-switch state so the
+    // portal can show an info banner ("auto-scrub is off — fire manually")
+    // above the workflow grid. Cheap, no auth, no DB read.
+    [HttpGet("scrubbing/config")]
+    public IActionResult Config() => Ok(new { autoScrub = _orchestrator.AutoScrubEnabled });
+
     // POST /notes/{doctorNoteId}/scrub — run a per-note scrub. The note's
     // visit defines DX + charges scope; brief chart context rides along.
     // Synchronous; blocks ~5-15s while Claude responds.
