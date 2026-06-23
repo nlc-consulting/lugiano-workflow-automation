@@ -14,7 +14,13 @@ public sealed class HcfaController : ControllerBase
 
     public HcfaController(HcfaPreviewService hcfa) => _hcfa = hcfa;
 
-    // GET /hcfa/preview?patientId=X&appointmentId=Y[&calibrate=true][&dx=N&dy=N]
+    // GET /hcfa/preview?patientId=X&appointmentId=Y[&mode=mail|fax][&calibrate=true][&dx=N&dy=N]
+    //   mode=mail (default) — data only, intended for pre-printed red CMS-1500
+    //     forms going out via snail mail. This is the original behavior.
+    //   mode=fax — same data positioning, plus a grayscale CMS-1500 (02-12)
+    //     form image composited as the page background, so the carrier
+    //     receives a complete-looking form via fax. CT uses one alignment
+    //     for both; mail and fax share the same coordinate system here.
     //   calibrate=true — overlay tiny grey "box id" labels above each value
     //     (e.g. "2", "5-street", "24D-CPT-0") so you can see what landed where.
     //   dx, dy — global offsets in PDF points (1pt = 1/72") applied to every
@@ -28,6 +34,7 @@ public sealed class HcfaController : ControllerBase
     public async Task<IActionResult> Preview(
         [FromQuery] int patientId,
         [FromQuery] int appointmentId,
+        [FromQuery] string? mode = null,
         [FromQuery] bool calibrate = false,
         [FromQuery] float dx = 0,
         [FromQuery] float dy = 0,
@@ -36,12 +43,15 @@ public sealed class HcfaController : ControllerBase
         if (patientId <= 0 || appointmentId <= 0)
             return BadRequest(new { error = "patientId and appointmentId are required." });
 
+        var fax = string.Equals(mode, "fax", StringComparison.OrdinalIgnoreCase);
+
         var data = await _hcfa.GetDataAsync(patientId, appointmentId, ct);
         if (data is null)
             return NotFound(new { error = "No service charges found for that appointment." });
 
-        var pdf = _hcfa.RenderPdf(data, calibrate, dx, dy);
-        var name = $"hcfa-{patientId}-{appointmentId}{(calibrate ? "-calibrate" : "")}.pdf";
+        var pdf = _hcfa.RenderPdf(data, calibrate, dx, dy, fax);
+        var suffix = (fax ? "-fax" : "") + (calibrate ? "-calibrate" : "");
+        var name = $"hcfa-{patientId}-{appointmentId}{suffix}.pdf";
         return File(pdf, "application/pdf", name);
     }
 }

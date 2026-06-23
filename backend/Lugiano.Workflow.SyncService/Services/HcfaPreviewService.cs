@@ -1,5 +1,6 @@
 using Dapper;
 using Lugiano.Workflow.SyncService.ChiroTouch;
+using Lugiano.Workflow.SyncService.Services.Pdf;
 using Lugiano.Workflow.SyncService.Util;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
@@ -164,7 +165,7 @@ public sealed class HcfaPreviewService
         var noteHeaders = (await conn.QueryAsync<ChartNoteHeader>(
             """
             SELECT cn.ID AS NoteId, cn.NoteDate, cn.SOAPPtr AS TextPtr,
-                   d.FullName AS DoctorName
+                   d.FullName AS DoctorName, cn.DoctorID AS DoctorId
             FROM   dbo.ChartNotes cn
             LEFT JOIN dbo.Doctors d ON d.ID = cn.DoctorID
             WHERE  cn.PatientID = @patientId
@@ -173,13 +174,37 @@ public sealed class HcfaPreviewService
             """,
             new { patientId, dos = header.AppointmentDateTime ?? DateTime.Today })).ToList();
 
+        // Signature lookup: prefer the row signed against THIS specific
+        // ChartNote (SigType='CN' + SigTypeID=noteId — CT's polymorphic key),
+        // fall back to the doctor's most recent signature image so portal-
+        // generated notes (which may not have a per-note signature row yet)
+        // still render with the doctor's mark.
+        var noteIds = noteHeaders.Select(n => n.NoteId).ToArray();
+        var perNoteSigs = noteIds.Length == 0
+            ? new Dictionary<int, SigRow>()
+            : (await conn.QueryAsync<SigRow>(
+                """
+                SELECT SigTypeID AS NoteId, ImageBase64 AS Image, SigTimestamp AS SignedAt
+                FROM   dbo.Signatures
+                WHERE  SigType = 'CN'
+                  AND  SigTypeID IN @noteIds
+                  AND  ImageBase64 IS NOT NULL;
+                """,
+                new { noteIds })).ToDictionary(r => r.NoteId);
+
         var notes = new List<HcfaNote>();
         foreach (var nh in noteHeaders)
         {
             string? text = null;
+            IReadOnlyList<IReadOnlyList<RtfRun>>? rich = null;
             if (nh.TextPtr is int ptr and not 0)
             {
-                try { text = RtfConverter.ToPlainText(await _noteReads.GetNoteRtfAsync(ptr)); }
+                try
+                {
+                    var rtf = await _noteReads.GetNoteRtfAsync(ptr);
+                    text = RtfConverter.ToPlainText(rtf);
+                    rich = RtfRichConverter.ToRuns(rtf);
+                }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex,
@@ -187,18 +212,52 @@ public sealed class HcfaPreviewService
                         ptr, nh.NoteId);
                 }
             }
-            notes.Add(new HcfaNote(nh.NoteId, nh.NoteDate, nh.DoctorName, text));
+            // Per-note signature first; fall back to whatever this doctor has
+            // signed most recently. Avoids a blank signature line when CT's
+            // CN row exists but ImageBase64 was never populated.
+            string? sigImage = null;
+            DateTime? signedAt = null;
+            if (perNoteSigs.TryGetValue(nh.NoteId, out var sig))
+            {
+                sigImage = sig.Image;
+                signedAt = sig.SignedAt;
+            }
+            if (sigImage is null && nh.DoctorId is int did)
+            {
+                var fallback = await conn.QuerySingleOrDefaultAsync<SigRow>(
+                    """
+                    SELECT TOP 1 ImageBase64 AS Image, SigTimestamp AS SignedAt
+                    FROM   dbo.Signatures
+                    WHERE  SigType = 'CN'
+                      AND  DoctorID = @did
+                      AND  ImageBase64 IS NOT NULL
+                    ORDER BY SigTimestamp DESC;
+                    """,
+                    new { did });
+                sigImage = fallback?.Image;
+                signedAt ??= fallback?.SignedAt;
+            }
+            notes.Add(new HcfaNote(nh.NoteId, nh.NoteDate, nh.DoctorName, text, sigImage, signedAt, rich));
         }
 
         return new HcfaData(header, dxRows, lineRows, notes);
     }
 
-    public byte[] RenderPdf(HcfaData data, bool calibrate = false, float dx = 0, float dy = 0)
+    public byte[] RenderPdf(HcfaData data, bool calibrate = false, float dx = 0, float dy = 0, bool fax = false)
     {
         // QuestPDF requires a license declaration at runtime. Community license
         // covers orgs under $1M revenue — fits Lugiano. Set once is fine.
         QuestPDF.Settings.License = LicenseType.Community;
+        return Document.Create(doc => AddPagesToDocument(doc, data, calibrate, dx, dy, fax)).GeneratePdf();
+    }
 
+    // Adds this HCFA's pages (form + chart notes) onto an existing document
+    // container. Used by the tracer endpoint to interleave HCFA forms after
+    // each tracer batch page — see TracerController.Preview. Caller owns the
+    // Document.Create wrapper and QuestPDF.Settings.License set-up.
+    public void AddPagesToDocument(IDocumentContainer doc, HcfaData data,
+        bool calibrate = false, float dx = 0, float dy = 0, bool fax = false)
+    {
         // Print-mode rendering with ABSOLUTE positioning. Coordinates were
         // measured from a real filled CMS-1500 (Good2Go claim 2024-58949,
         // patient Ortiz Zapata, faxed 12/30/25) via pdftotext -bbox-layout.
@@ -209,12 +268,18 @@ public sealed class HcfaPreviewService
         // calibrate=true overlays tiny markers + box labels at each field
         // position so the user can print on plain paper, hold against a real
         // form, and verify alignment. Use ?calibrate=true on the endpoint.
+        //
+        // fax=true composites a color CMS-1500 (02-12) form image as the
+        // page background, so the carrier receives a complete-looking form
+        // via fax. The data coordinates are the same in both modes — CT uses
+        // one alignment for mail + fax, and we match that. The overlay PNG is
+        // sized to the full letter page; if the boxes don't line up under the
+        // data the PNG needs re-rasterizing, not separate coordinates.
         var fields = BuildFieldList(data);
+        var overlayPath = fax ? ResolveOverlayPath() : null;
 
-        return Document.Create(doc =>
-        {
-            // ---- PAGE 1: the HCFA form ----
-            doc.Page(page =>
+        // ---- PAGE 1: the HCFA form ----
+        doc.Page(page =>
             {
                 page.Size(PageSizes.Letter);
                 page.Margin(0);
@@ -225,6 +290,17 @@ public sealed class HcfaPreviewService
                     // Primary layer is empty (transparent) — we just need a
                     // canvas for the absolutely-positioned children.
                     layers.PrimaryLayer().Width(612).Height(792);
+
+                    // Fax overlay: blank CMS-1500 form rendered underneath
+                    // the data so the recipient sees a complete form. Added
+                    // BEFORE the field layers so text sits on top of the
+                    // form lines (matching CT's fax output).
+                    if (overlayPath is not null)
+                    {
+                        layers.Layer().AlignLeft().AlignTop()
+                            .Width(612).Height(792)
+                            .Image(overlayPath).FitArea();
+                    }
 
                     foreach (var f in fields)
                     {
@@ -252,105 +328,26 @@ public sealed class HcfaPreviewService
             });
 
             // ---- PAGE 2+: chart notes for this DOS ----
-            // Format mirrors ChiroTouch's printed chart-notes layout: header
-            // strip with practice block + patient/insurance summary, then the
-            // SOAP body. Long notes flow naturally to additional pages.
-            foreach (var note in data.Notes)
-            {
-                doc.Page(notePage =>
-                {
-                    notePage.Size(PageSizes.Letter);
-                    notePage.Margin(0.6f, Unit.Inch);
-                    notePage.DefaultTextStyle(t => t.FontSize(10).FontFamily(Fonts.Calibri));
+            // Delegated to the shared renderer so the printed/faxed chart-note
+            // format + signature block are identical across every flow and match
+            // ChiroTouch's output. See ChartNotesRenderer.
+            var ctx = new ChartNoteHeaderCtx(
+                PatientDisplayName: data.Header.PatientDisplayName,
+                AccountNo: data.Header.AccountNo?.ToString() ?? data.Header.PatientId.ToString(),
+                PatientBirthDate: data.Header.PatientBirthDate,
+                InsCoName: data.Header.InsCoName,
+                PolicyNo: data.Header.GroupNo,
+                InsuredId: data.Header.InsuredIdNo,
+                FacilityBlock: data.Header.FacilityAddress);
 
-                    notePage.Header().Column(c =>
-                    {
-                        // Top row: "Chart Notes" + patient name | practice block
-                        c.Item().Row(row =>
-                        {
-                            row.RelativeItem().Column(p =>
-                            {
-                                p.Item().Text("Chart Notes").FontSize(13).Bold();
-                                p.Item().PaddingTop(2).Text(data.Header.PatientDisplayName).FontSize(11);
-                            });
-                            row.ConstantItem(220).AlignRight().Column(p =>
-                            {
-                                var facLines = (data.Header.FacilityAddress ?? string.Empty)
-                                    .Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-                                foreach (var line in facLines.Take(3))
-                                    p.Item().Text(line.Trim()).FontSize(9);
-                            });
-                        });
-
-                        // Patient + insurance summary row
-                        c.Item().PaddingTop(8).Row(row =>
-                        {
-                            row.RelativeItem().Column(p =>
-                            {
-                                var acct = data.Header.AccountNo?.ToString() ?? data.Header.PatientId.ToString();
-                                p.Item().Text(t =>
-                                {
-                                    t.Span("Patient: ").FontSize(9).Bold();
-                                    t.Span(data.Header.PatientDisplayName).FontSize(9);
-                                });
-                                p.Item().Text(t =>
-                                {
-                                    t.Span("Acct #: ").FontSize(9).Bold();
-                                    t.Span(acct).FontSize(9);
-                                });
-                                p.Item().Text(t =>
-                                {
-                                    t.Span("DOB: ").FontSize(9).Bold();
-                                    t.Span(Fmt(data.Header.PatientBirthDate)).FontSize(9);
-                                });
-                            });
-                            row.RelativeItem().Column(p =>
-                            {
-                                p.Item().Text(t =>
-                                {
-                                    t.Span("Ins Co: ").FontSize(9).Bold();
-                                    t.Span(data.Header.InsCoName ?? "—").FontSize(9);
-                                });
-                                p.Item().Text(t =>
-                                {
-                                    t.Span("Insured ID: ").FontSize(9).Bold();
-                                    t.Span(data.Header.InsuredIdNo ?? "—").FontSize(9);
-                                });
-                            });
-                        });
-
-                        // Date + provider strip
-                        c.Item().PaddingTop(6).Row(row =>
-                        {
-                            row.RelativeItem().Text(t =>
-                            {
-                                t.Span("Date ").FontSize(10).Bold();
-                                t.Span(Fmt(note.NoteDate)).FontSize(10);
-                            });
-                            row.RelativeItem().Text(t =>
-                            {
-                                t.Span("Provider: ").FontSize(10).Bold();
-                                t.Span(note.DoctorName ?? "—").FontSize(10);
-                            });
-                        });
-                        c.Item().PaddingVertical(6).LineHorizontal(1).LineColor(Colors.Grey.Medium);
-                    });
-
-                    notePage.Content().Text(note.PlainText ?? "(No note body available — RTF could not be read.)")
-                        .FontFamily(Fonts.Calibri).FontSize(10).LineHeight(1.35f);
-
-                    notePage.Footer().AlignCenter().Text(t =>
-                    {
-                        t.Span($"{data.Header.PatientDisplayName}  ·  ").FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.Span(Fmt(note.NoteDate)).FontSize(8).Bold().FontColor(Colors.Grey.Darken1);
-                        t.Span("  ·  Page ").FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.CurrentPageNumber().FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.Span(" of ").FontSize(8).FontColor(Colors.Grey.Darken1);
-                        t.TotalPages().FontSize(8).FontColor(Colors.Grey.Darken1);
-                    });
-                });
-            }
-        }).GeneratePdf();
+            ChartNotesRenderer.AddNotePages(doc, ctx, data.Notes.Select(n => new RenderableNote(
+                NoteDate: n.NoteDate,
+                ProviderName: n.DoctorName,
+                RichBody: n.RichBody,
+                PlainTextFallback: n.PlainText,
+                SignatureImageBase64: n.SignatureImage,
+                SignedProviderName: n.DoctorName,
+                SignedAt: n.SignedAt)));
     }
 
     // Build the absolutely-positioned field list for one claim. Coordinates
@@ -644,6 +641,21 @@ public sealed class HcfaPreviewService
         return f;
     }
 
+    // Locates the blank-form PNG packaged under Assets/. Returns null +
+    // logs a warning if the file is missing so the renderer falls back to
+    // a data-only page instead of throwing — fax with no overlay is still
+    // better than a hard 500 mid-demo.
+    private string? ResolveOverlayPath()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Assets", "CMS-1500-overlay.png");
+        if (!File.Exists(path))
+        {
+            _logger.LogWarning("HCFA fax overlay missing at {Path} — rendering data-only.", path);
+            return null;
+        }
+        return path;
+    }
+
     // One positioned text element on the form. BoxId is the human-readable
     // HCFA box ref (used by the ?calibrate=true overlay for alignment checks).
     private sealed record HcfaField(string BoxId, float X, float Y, string Value, float FontSize = 9);
@@ -746,9 +758,30 @@ public sealed class ChartNoteHeader
     public DateTime? NoteDate { get; set; }
     public int? TextPtr { get; set; }
     public string? DoctorName { get; set; }
+    public int? DoctorId { get; set; }
 }
 
-public sealed record HcfaNote(int NoteId, DateTime? NoteDate, string? DoctorName, string? PlainText);
+// Signature row (image + signed timestamp) for a chart note. Class rather than a
+// value tuple so the element name "Image" can't collide with QuestPDF's Image().
+public sealed class SigRow
+{
+    public int NoteId { get; set; }
+    public string? Image { get; set; }
+    public DateTime? SignedAt { get; set; }
+}
+
+public sealed record HcfaNote(
+    int NoteId, DateTime? NoteDate, string? DoctorName, string? PlainText,
+    // ImageBase64 from the doctor's stored Signature row in PSChiro
+    // (SigType='CN' for this NoteId, else fall back to the doctor's latest).
+    // Rendered at the bottom of the chart-note page so the printed/faxed
+    // note matches what CT outputs.
+    string? SignatureImage = null,
+    // SigTimestamp for the "Electronically Signed … <provider> <when>" line.
+    DateTime? SignedAt = null,
+    // Colored/bold runs parsed from the note RTF (preferred over PlainText for
+    // rendering so the body matches ChiroTouch's blue/red formatting).
+    IReadOnlyList<IReadOnlyList<RtfRun>>? RichBody = null);
 
 public sealed record HcfaData(
     HcfaHeaderRow Header,

@@ -20,4 +20,14 @@
     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.*" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- HCFA fax overlay: blank CMS-1500 (02-12) form rasterized at 200 DPI
+         COLOR (keep the red — the form's red ink is OCR-drop-out at the
+         carrier scanner, and downstream consumers expect a faithful CMS-1500
+         look). Composited as the page background when ?mode=fax so the
+         carrier receives a complete-looking form via fax. Mail mode skips
+         the overlay (data prints onto pre-printed red forms). -->
+    <Content Include="Assets\CMS-1500-overlay.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
