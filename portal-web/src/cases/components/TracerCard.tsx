@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useRecordContext } from 'react-admin'
+import { useNotify, useRecordContext } from 'react-admin'
 import {
   Alert,
   Box,
@@ -19,6 +19,7 @@ import {
   Typography,
 } from '@mui/material'
 import PictureAsPdf from '@mui/icons-material/PictureAsPdf'
+import Send from '@mui/icons-material/Send'
 
 const WORKFLOW_API = import.meta.env.VITE_WORKFLOW_API_URL || '/workflow-api'
 
@@ -55,6 +56,8 @@ const TracerCard = () => {
   // Default on — the common workflow is "tracer + the HCFAs to back it up
   // in one fax". Uncheck to send the tracer alone.
   const [includeHcfa, setIncludeHcfa] = useState(true)
+  const [faxing, setFaxing] = useState(false)
+  const notify = useNotify()
 
   useEffect(() => {
     if (patientId == null) return
@@ -110,6 +113,31 @@ const TracerCard = () => {
     )
   }
 
+  const faxNow = async () => {
+    if (patientId == null || selected.size === 0) return
+    const dates = Array.from(selected).join(',')
+    setFaxing(true)
+    try {
+      const resp = await fetch(
+        `${WORKFLOW_API}/fax/tracer?patientId=${patientId}&billDates=${dates}&includeHcfa=${includeHcfa}`,
+        { method: 'POST' },
+      )
+      const body = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(body?.error || `HTTP ${resp.status}`)
+      const sent = body?.sent ?? 0
+      const ids = (body?.results ?? [])
+        .map((r: { faxId?: string; to?: string }) => `${r.to ?? '?'}→${r.faxId ?? '?'}`)
+        .join(', ')
+      notify(`Fax sent (${sent}): ${ids}`, { type: 'success' })
+    } catch (e) {
+      notify(`Fax failed: ${e instanceof Error ? e.message : 'unknown error'}`, {
+        type: 'error',
+      })
+    } finally {
+      setFaxing(false)
+    }
+  }
+
   if (patientId == null) return null
 
   return (
@@ -137,12 +165,24 @@ const TracerCard = () => {
               </Typography>
               <Button
                 size="small"
-                variant="contained"
+                variant="outlined"
                 disabled={selected.size === 0}
                 startIcon={<PictureAsPdf fontSize="small" />}
                 onClick={generate}
               >
                 Generate {selected.size > 1 ? 'tracers' : 'tracer'}
+              </Button>
+              <Button
+                size="small"
+                variant="contained"
+                color="primary"
+                disabled={selected.size === 0 || faxing}
+                startIcon={
+                  faxing ? <CircularProgress size={14} /> : <Send fontSize="small" />
+                }
+                onClick={faxNow}
+              >
+                {faxing ? 'Faxing…' : 'Fax now'}
               </Button>
             </>
           )}

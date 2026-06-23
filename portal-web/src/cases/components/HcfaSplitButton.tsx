@@ -1,7 +1,9 @@
 import { useRef, useState } from 'react'
+import { useNotify } from 'react-admin'
 import {
   Button,
   ButtonGroup,
+  CircularProgress,
   ClickAwayListener,
   Grow,
   MenuItem,
@@ -14,14 +16,13 @@ import Description from '@mui/icons-material/Description'
 
 const WORKFLOW_API = import.meta.env.VITE_WORKFLOW_API_URL || '/workflow-api'
 
-// HCFA generation has two real-world output modes: pre-printed red form
-// going out via snail mail (data only), and fax to the carrier (data
-// composited on top of a blank CMS-1500 image so the recipient sees a
-// complete form). The coordinates are identical — CT uses one alignment
-// for both — so the only difference is whether we paint the overlay.
-//
-// Split button: main click = mail (the historical default), dropdown
-// exposes fax. Two clicks for fax, one for mail.
+// HCFA generation has three output modes:
+//   - Mail: data-only PDF for pre-printed red forms (default click).
+//   - Fax preview: composites the blank form image, opens PDF for review.
+//   - Fax now: same fax-mode PDF, sent directly to the carrier via Documo
+//     using the fax number on the patient's InsPolicy.
+// Mail/fax-preview both open the PDF in a new tab; "Fax now" never opens —
+// just fires the send and shows a toast with the Documo job id.
 type Props = {
   patientId: number
   visitId: number
@@ -29,11 +30,35 @@ type Props = {
 
 const HcfaSplitButton = ({ patientId, visitId }: Props) => {
   const [open, setOpen] = useState(false)
+  const [sending, setSending] = useState(false)
   const anchorRef = useRef<HTMLDivElement | null>(null)
+  const notify = useNotify()
 
   const open_ = (mode: 'mail' | 'fax') => {
     const url = `${WORKFLOW_API}/hcfa/preview?patientId=${patientId}&appointmentId=${visitId}&mode=${mode}`
     window.open(url, '_blank')
+  }
+
+  const sendFax = async () => {
+    setOpen(false)
+    setSending(true)
+    try {
+      const resp = await fetch(
+        `${WORKFLOW_API}/fax/hcfa?patientId=${patientId}&appointmentId=${visitId}`,
+        { method: 'POST' },
+      )
+      const body = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(body?.error || `HTTP ${resp.status}`)
+      const id = body?.results?.[0]?.faxId || '(no id)'
+      const to = body?.results?.[0]?.to || ''
+      notify(`Fax sent to ${to} (Documo id: ${id})`, { type: 'success' })
+    } catch (e) {
+      notify(`Fax failed: ${e instanceof Error ? e.message : 'unknown error'}`, {
+        type: 'error',
+      })
+    } finally {
+      setSending(false)
+    }
   }
 
   return (
@@ -47,8 +72,9 @@ const HcfaSplitButton = ({ patientId, visitId }: Props) => {
           aria-label="HCFA output mode"
           onClick={() => setOpen((o) => !o)}
           sx={{ minWidth: 0, px: 0.5 }}
+          disabled={sending}
         >
-          <ArrowDropDown />
+          {sending ? <CircularProgress size={14} /> : <ArrowDropDown />}
         </Button>
       </ButtonGroup>
       <Popper
@@ -78,8 +104,9 @@ const HcfaSplitButton = ({ patientId, visitId }: Props) => {
                       open_('fax')
                     }}
                   >
-                    Fax (overlay on blank form)
+                    Fax preview (overlay on blank form)
                   </MenuItem>
+                  <MenuItem onClick={sendFax}>Fax now (Documo)</MenuItem>
                 </MenuList>
               </ClickAwayListener>
             </Paper>
