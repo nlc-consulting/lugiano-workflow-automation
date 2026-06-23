@@ -102,6 +102,9 @@ export const AppAdmin = () => (
       icon={Receipt}
       options={{ label: 'EOB' }}
     />
+    {/* Tracer moved to the case detail page — see TracerCard. The standalone
+        page (TracerList.tsx) is left in place in case we want a portal-wide
+        AR view later, but isn't surfaced in the sidebar today. */}
     {/* Hidden from the sidebar (no list/icon) — kept registered so the
         workflowDataProvider still routes scrub-review fetches from
         DoctorReviewList. Reintroduce as a top-level entry once a separate

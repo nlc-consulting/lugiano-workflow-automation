@@ -86,6 +86,17 @@ const PatientHeader = () => {
               )}
             </Box>
             <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+              {/* AccountNo is the team-facing ID — bolded so it anchors the
+                  identifier line. Internal Patients.ID kept alongside for
+                  developers / URL traceability. */}
+              {r.accountNo != null && (
+                <>
+                  <Box component="span" sx={{ fontWeight: 700, color: 'text.primary' }}>
+                    Acct #{r.accountNo}
+                  </Box>
+                  {' · '}
+                </>
+              )}
               ID {r.patientId} · {r.sex ?? '—'} · {r.primaryDoctor ?? '—'}
               {injuryDate && <> · accident {injuryDate}</>}
             </Typography>

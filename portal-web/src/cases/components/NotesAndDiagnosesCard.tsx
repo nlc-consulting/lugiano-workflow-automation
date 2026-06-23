@@ -15,10 +15,9 @@ import {
   Typography,
 } from '@mui/material'
 import ReplyAll from '@mui/icons-material/ReplyAll'
-import Description from '@mui/icons-material/Description'
 
-const WORKFLOW_API = import.meta.env.VITE_WORKFLOW_API_URL || '/workflow-api'
 import SectionCard from './SectionCard'
+import HcfaSplitButton from './HcfaSplitButton'
 import { formatShortDate, formatVisitTime } from './formatters'
 import KickbackModal from '../KickbackModal'
 import ScrubPanel from '../ScrubPanel'
@@ -51,6 +50,9 @@ type NoteRow = NoteVisit & {
   doctor?: string | null
   plainText?: string | null
   diagnoses?: DiagnosisItem[] | null
+  // Pre-formatted clinic-local signing timestamp (chart notes only). Null for
+  // unsigned notes and portal corrections.
+  signedAt?: string | null
   latestScrub?: ScrubSnapshot | null
 }
 
@@ -260,22 +262,10 @@ const NotesAndDiagnosesCard = () => {
                         <>
                           {renderVisitChip(currentNote)}
                           {currentNote.visitId != null && (
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              color="primary"
-                              startIcon={<Description fontSize="small" />}
-                              onClick={() => {
-                                // Phase 1: preview-only. Opens the PDF in a new tab.
-                                // No CT writeback yet — that's the next step.
-                                const url = `${WORKFLOW_API}/hcfa/preview?patientId=${
-                                  (record?.patientId as number) ?? 0
-                                }&appointmentId=${currentNote.visitId}`
-                                window.open(url, '_blank')
-                              }}
-                            >
-                              Generate HCFA
-                            </Button>
+                            <HcfaSplitButton
+                              patientId={(record?.patientId as number) ?? 0}
+                              visitId={currentNote.visitId}
+                            />
                           )}
                           <Button
                             size="small"
@@ -308,6 +298,18 @@ const NotesAndDiagnosesCard = () => {
                   ) : (
                     <Typography variant="body2" color="text.secondary">
                       Note text not yet available for this row.
+                    </Typography>
+                  )}
+
+                  {/* Signing line — mirrors ChiroTouch's "Signed: …" footer.
+                      Shown only for signed chart notes. */}
+                  {currentNote.signedAt && (
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ display: 'block', mt: 1, fontStyle: 'italic' }}
+                    >
+                      Signed: {currentNote.signedAt}
                     </Typography>
                   )}
 

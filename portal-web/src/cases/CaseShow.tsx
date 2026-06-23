@@ -10,6 +10,7 @@ import NotesAndDiagnosesCard from './components/NotesAndDiagnosesCard'
 import ChargesCard from './components/ChargesCard'
 import FooterMeta from './components/FooterMeta'
 import CaseScrubCard from './components/CaseScrubCard'
+import TracerCard from './components/TracerCard'
 
 // Browser-back so the button returns to whichever list the user came from
 // (Patients lookup or the Automation queue) — react-admin's ListButton would
@@ -46,6 +47,7 @@ const CaseShowContent = () => (
     <CaseScrubCard />
     <InsurancePoliciesCard />
     <NotesAndDiagnosesCard />
+    <TracerCard />
     <ChargesCard />
     <FooterMeta />
   </Box>
