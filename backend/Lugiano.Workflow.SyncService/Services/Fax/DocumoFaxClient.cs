@@ -1,5 +1,4 @@
 using System.Net.Http.Headers;
-using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 
@@ -60,7 +59,8 @@ public sealed class DocumoFaxClient
 
         var pdf = new ByteArrayContent(pdfBytes);
         pdf.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
-        form.Add(pdf, "attachment", filename);
+        // Documo's POST /v1/faxes wants "attachments" (plural) per their docs.
+        form.Add(pdf, "attachments", filename);
 
         using var req = new HttpRequestMessage(HttpMethod.Post, "v1/faxes")
         {
@@ -86,24 +86,26 @@ public sealed class DocumoFaxClient
         return new DocumoSendResult(id, status, normalized, pdfBytes.Length);
     }
 
-    // Basic auth with the JWT-style API key as the username and empty password.
-    // To switch to Bearer (newer Documo accounts may require it), replace with:
-    //   return new AuthenticationHeaderValue("Bearer", _options.ApiKey);
-    private AuthenticationHeaderValue BuildAuthHeader()
-    {
-        var encoded = Convert.ToBase64String(Encoding.ASCII.GetBytes(_options.ApiKey + ":"));
-        return new AuthenticationHeaderValue("Basic", encoded);
-    }
+    // Documo's non-standard auth: literal "Basic " + the raw JWT (NOT
+    // base64-encoded user:password as standard HTTP Basic would require).
+    // Confirmed against the official Documo curl example:
+    //   Authorization: Basic <api_key>
+    // Their Postman docs label this as "Basic" but the value is the raw key.
+    // Anything else returns "Wrong authorization type" with their JWT-based
+    // keys.
+    private AuthenticationHeaderValue BuildAuthHeader() =>
+        new("Basic", _options.ApiKey);
 
-    // Documo accepts E.164 (+13125551234) or plain digits. Strip everything
-    // non-numeric, keep the last 10 (handles "+1", "1-", "(312) 555-...").
-    // Returns "" if we don't have a sensible US-shaped number.
+    // Documo requires E.164 with country code (+1 for US). Strip everything
+    // non-numeric, take the last 10 digits, and prepend "1" so the carrier
+    // sees a complete US number. Without the country prefix Documo rejects
+    // with "Invalid country calling code".
     private static string NormalizeFaxNumber(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
         var digits = new string(raw.Where(char.IsDigit).ToArray());
         if (digits.Length < 10) return string.Empty;
-        return digits[^10..];
+        return "1" + digits[^10..];
     }
 
     // Documo's standard success body is { "id": "...", "status": "..." }.
