@@ -6,7 +6,7 @@ namespace Lugiano.Workflow.SyncService.Services.EobScanning;
 // change below — used in cost/quality reporting + cache invalidation.
 public static class ClaudeEobPrompt
 {
-    public const string PromptVersion = "eob-v3-check-fidelity-2026-07-02";
+    public const string PromptVersion = "eob-v4-void-watermark-2026-07-02";
 
     public const string SystemPrompt = """
 You are extracting structured data from a scanned multi-page batch of insurance EOB
@@ -42,9 +42,26 @@ Extract two arrays:
      - An EOB header block showing "Total Payment Amount: $X". That's a payment summary,
        NOT a check stub. The actual check stub with PAY TO / MICR encoding is elsewhere.
      - Rotated pages where the visible fields don't clearly show a check-stub layout.
-     - Watermarks, DupeProof security notices, or endorsement backer text.
      - Pages that are mostly blank with just some header text and no check stub layout.
    If in doubt, do NOT emit a check entry. False checks damage the reconciliation flow.
+
+   VOID WATERMARKS ARE NOT VOIDED CHECKS (CRITICAL):
+   Many real, deposited checks carry a "VOID" pattern as a COPY-PROTECTION SECURITY
+   FEATURE — the original printed check is fine but a photocopy or scan reveals a
+   repeating "VOID VOID VOID" pattern printed across the background. This is present
+   on Agency Insurance, Truist Bank, and other insurance-issued checks on light-blue
+   or light-green security paper.
+   HOW TO TELL: a security-feature VOID is a FINE, REPEATING pattern uniformly
+   distributed across the check face (often diagonal, often paired with light-color
+   background paper). It does NOT invalidate the check.
+   An ACTUAL voided check has ONE large "VOID" stamp on the face, or a signature
+   crossed out, or "CANCELLED" written across it — a single deliberate mark, not a
+   decorative repeating pattern.
+   When you see the repeating decorative VOID watermark: TREAT THE CHECK AS REAL.
+   All other check-stub elements (PAY TO, MICR encoding, signature, endorsement
+   line, dollar amount, payee) are still valid — extract as normal.
+   Same rule applies to "DupeProof", "SECURITY", or other repeating anti-forgery
+   watermarks on the check background.
 
 2) LINE_ITEMS — one entry per service line on the EOB.
    - page_number: the PDF page where the line appears (see PAGE NUMBERING below).
