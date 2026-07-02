@@ -21,8 +21,7 @@ public sealed class ScrubController : ControllerBase
     }
 
     // GET /scrubbing/config — expose the AutoScrub kill-switch state so the
-    // portal can show an info banner ("auto-scrub is off — fire manually")
-    // above the workflow grid. Cheap, no auth, no DB read.
+    // portal can show an "auto-scrub is off" banner. No auth, no DB read.
     [HttpGet("scrubbing/config")]
     public IActionResult Config() => Ok(new { autoScrub = _orchestrator.AutoScrubEnabled });
 
@@ -52,8 +51,7 @@ public sealed class ScrubController : ControllerBase
         return Ok(Project(result));
     }
 
-    // POST /notes/{doctorNoteId}/override — manually flip this note's verdict.
-    // Used by reviewers / admins to mark a note 'good' or send it back to 'bad'
+    // POST /notes/{doctorNoteId}/override — manually flip a note's verdict
     // without re-running Claude. Writes a fresh ScrubResult so the latest-wins
     // rollup picks it up immediately.
     [HttpPost("notes/{doctorNoteId:int}/override")]
@@ -80,12 +78,10 @@ public sealed class ScrubController : ControllerBase
 
     public sealed record OverrideRequest(string Verdict, string? OverriddenBy, string? Reason);
 
-    // POST /scrub/backfill-latest?dryRun=true&topN=50 — fills in scrub results
-    // for the latest DoctorNote per case where that note has no scrub yet.
-    // Bounded by topN (oldest-updated cases first) so cost is predictable.
-    // dryRun=true returns identified counts without firing Claude.
-    // Sequential execution — predictable load on the Anthropic API and easy
-    // to interrupt. Re-run to pick up cases that errored.
+    // POST /scrub/backfill-latest?dryRun=true&topN=50 — scrubs the latest
+    // DoctorNote per case where it has no scrub yet. Bounded by topN so cost is
+    // predictable; dryRun=true returns counts without firing Claude. Sequential
+    // (predictable Anthropic API load, easy to interrupt); re-run to retry errors.
     [HttpPost("scrub/backfill-latest")]
     public async Task<IActionResult> BackfillLatest(
         [FromQuery] bool dryRun = true,
@@ -96,9 +92,8 @@ public sealed class ScrubController : ControllerBase
 
         await using var db = await _dbFactory.CreateDbContextAsync(ct);
 
-        // Pull all notes for cases-of-interest, group in memory (EF Core 8
-        // can't translate g.OrderBy().First() projections). Cheap — note
-        // count is bounded by total cases × ~50 history per case.
+        // Pull all notes and group in memory (EF Core 8 can't translate
+        // g.OrderBy().First() projections). Cheap — bounded by cases × ~50.
         var allNotes = await db.DoctorNotes.AsNoTracking()
             .Select(n => new { n.Id, n.WorkflowCaseId, n.NoteDate })
             .ToListAsync(ct);

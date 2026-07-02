@@ -169,9 +169,8 @@ public sealed class WorkflowDbContext : DbContext
             e.Property(x => x.Amount).HasColumnType("decimal(12,2)");
             e.Property(x => x.Payer).HasMaxLength(200);
             e.Property(x => x.Administrator).HasMaxLength(200);
-            // Most lookups are "all checks for this scan" — composite index
-            // covers that AND the dedupe-by-(scan, page, check#) pattern in
-            // the orchestrator's overlap handling.
+            // Composite index covers "all checks for this scan" AND the
+            // orchestrator's dedupe-by-(scan, page, check#) overlap handling.
             e.HasIndex(x => new { x.EobScanId, x.PageNumber });
         });
 

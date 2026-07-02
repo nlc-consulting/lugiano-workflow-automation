@@ -1,16 +1,14 @@
 namespace Lugiano.Workflow.SyncService.Services.Fax;
 
 // Practice-side info printed in the FROM block of every fax cover sheet.
-// Bound from the "FaxCover" section in appsettings so the practice can
-// update address/phone without a code change (e.g. when the second office
-// becomes the primary billing address).
+// Bound from the "FaxCover" appsettings section so the practice can update
+// address/phone without a code change.
 public sealed class FaxCoverOptions
 {
     public const string SectionName = "FaxCover";
 
-    // Practice name as it should appear on outbound faxes. Defaults tuned to
-    // the current PA Pain & Rehab site; override in appsettings for other
-    // deployments.
+    // Defaults tuned to the current PA Pain & Rehab site; override in
+    // appsettings for other deployments.
     public string PracticeName { get; set; } = "PA Pain & Rehabilitation";
     public string AddressLine1 { get; set; } = "6522 Lebanon Ave";
     public string CityStateZip  { get; set; } = "Philadelphia, PA 19151";

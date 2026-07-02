@@ -5,8 +5,8 @@ using QuestPDF.Infrastructure;
 
 namespace Lugiano.Workflow.SyncService.Services.Pdf;
 
-// Patient/practice context shared by every page of a chart-note run. Mirrors the
-// strip ChiroTouch prints atop each chart-note page.
+// Patient/practice context shared by every page of a chart-note run. Mirrors
+// the strip ChiroTouch prints atop each chart-note page.
 public sealed record ChartNoteHeaderCtx(
     string PatientDisplayName,
     string AccountNo,

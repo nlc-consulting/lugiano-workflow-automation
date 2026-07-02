@@ -11,9 +11,9 @@ public sealed class EobScanLineItem
     public int PageNumber { get; set; }
 
     public string? ClaimNumber { get; set; }
-    // Patient name EXACTLY as printed (no reordering, no normalization). Match
-    // layer downstream is responsible for resolving variants like
-    // "ZAMBRANO, AMADO" vs "AMADO ZAMBRANO" to a single ChiroTouch patient.
+    // Patient name EXACTLY as printed (no reordering/normalization). The
+    // downstream match layer resolves variants ("ZAMBRANO, AMADO" vs "AMADO
+    // ZAMBRANO") to a single ChiroTouch patient.
     public string? PatientNameRaw { get; set; }
     public string? BillNumber { get; set; }
     public string? ServiceDate { get; set; }
@@ -30,10 +30,9 @@ public sealed class EobScanLineItem
     public decimal PaidAmount { get; set; }
     public decimal WriteOffAmount { get; set; }
 
-    // JSON array: [{"code":"00663","description":"..."}, ...]
-    // Multiple codes per line is common — DS uses "/" delimiters in their xlsx
-    // but JSON keeps the (code, description) pairing clean for downstream.
-    // Descriptions are backfilled by the orchestrator from sibling lines in
-    // the same scan when Claude shortcuts them on repeats.
+    // JSON array: [{"code":"00663","description":"..."}, ...]. Multiple codes
+    // per line is common; JSON keeps the (code, description) pairing clean
+    // (DS uses "/" delimiters). Descriptions backfilled by the orchestrator
+    // from sibling lines when Claude shortcuts them on repeats.
     public string ReasonCodesJson { get; set; } = "[]";
 }

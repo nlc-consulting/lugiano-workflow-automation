@@ -4,31 +4,21 @@ using Lugiano.Workflow.SyncService.ChiroTouch;
 namespace Lugiano.Workflow.SyncService.Services;
 
 // Applies an EOB to PSChiro for real. Re-runs the preview match on the
-// uploaded xlsx (so the client can't tamper with the proposed updates) and
-// writes every unambiguous match in a SINGLE transaction. Ambiguous +
-// unmatched lines are returned as a report — no write attempted.
+// uploaded xlsx (so the client can't tamper with proposed updates) and writes
+// every unambiguous match in a SINGLE transaction. Ambiguous + unmatched lines
+// come back as a report — no write attempted.
 //
-// Per-line write recipe (Primary insurance only — secondary/patient
-// adjustments are future scope):
-//   1. UPDATE Transactions
-//        SET PriPaidAmt = PriPaidAmt + @paid,
-//            WOAmt      = WOAmt      + @wo
-//      WHERE ID = @tranId.
-//   2. UPDATE BilledCharges
-//        SET PaidDate   = GETDATE(),
-//            AppliedAmt = @paid          -- per-charge payment slice
-//      WHERE ChargeTranID = @tranId AND PaidDate IS NULL.
-//      (BilledCharges row may be absent if the charge was never billed —
-//       we still post to Transactions; the AR rollup will reflect it.)
-//      Note: BilledCharges.AppliedAmt = paid only, NOT paid+writeoff.
-//      Write-offs live on Transactions.WOAmt (which we already update).
-//      Also leaving PaymentTranID NULL — populating it would require
-//      INSERTing a payment Transactions row (TranType='P') and linking,
-//      which we can add later for full ledger parity if needed.
+// Per-line write recipe (Primary insurance only — secondary/patient is future scope):
+//   1. Transactions: PriPaidAmt += @paid, WOAmt += @wo WHERE ID = @tranId.
+//   2. BilledCharges: PaidDate = now, AppliedAmt = @paid (paid only, NOT
+//      paid+writeoff — write-offs live on Transactions.WOAmt) WHERE
+//      ChargeTranID = @tranId AND PaidDate IS NULL. The BilledCharges row may
+//      be absent if the charge was never billed; we still post to Transactions.
+//      PaymentTranID left NULL — populating it needs a payment Transactions row
+//      (TranType='P') + link, addable later for full ledger parity.
 //
-// Idempotency guard: skip if the new PriPaidAmt would exceed TranAmt
-// (over-payment) OR if BilledCharges.PaidDate is already set (already
-// posted). Skipped rows ride out in the response as Skipped[].
+// Idempotency guard: skip if new PriPaidAmt would exceed TranAmt (over-payment)
+// or BilledCharges.PaidDate is already set. Skipped rows surface as Skipped[].
 public sealed class EobPostingService
 {
     private readonly ISourceDbWriteConnectionFactory _writeDb;
@@ -49,9 +39,8 @@ public sealed class EobPostingService
 
     public async Task<EobPostingResult> ApplyAsync(Stream xlsxStream, CancellationToken ct)
     {
-        // Re-run the match so the writes always reflect the current
-        // ChiroTouch state, not whatever the client thinks they saw.
-        // Stream has to be re-readable — copy to a memory buffer.
+        // Re-run the match against current ChiroTouch state, not whatever the
+        // client saw. Stream must be re-readable — buffer it in memory.
         using var buffer = new MemoryStream();
         await xlsxStream.CopyToAsync(buffer, ct);
         buffer.Position = 0;
@@ -79,9 +68,8 @@ public sealed class EobPostingService
         {
             foreach (var m in preview.Matched)
             {
-                // Re-read the LIVE state for this charge inside the tx — guards
-                // against a race where another process posted between preview
-                // and apply. Cheap; single-row read.
+                // Re-read live charge state inside the tx to guard against a
+                // race where another process posted between preview and apply.
                 var live = await conn.QuerySingleOrDefaultAsync<LiveTx>(
                     """
                     SELECT t.ID                              AS TranId,

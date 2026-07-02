@@ -39,11 +39,73 @@ YOUR JOB — confirm the focal note contains:
    "Adjusted patient" without listing levels is incomplete. "CMT to L1, L2,
    L3, left SI" is complete.
 
+4. **Documented services vs billed charges (bi-directional)** — reconcile
+   the focal note's documented treatments against the charges list. Flag
+   BOTH directions:
+   - **Documented but not billed**: the focal note describes a service
+     (e.g. "group therapeutic exercise for 10 minutes", "moist heat pack
+     applied to lumbar region for 15 min", "EMS to bilateral trapezius")
+     that has no matching CPT charge on the visit. Emit a
+     `charge_alignment` issue naming the documented service that appears
+     missing from the bill.
+   - **Billed but not documented**: a CPT on the charges list has no
+     supporting narrative in the focal note (e.g. 97014 EMS billed but
+     the note doesn't mention electrical stimulation being performed;
+     97012 mechanical traction billed but the note doesn't describe
+     traction). Emit a `charge_alignment` issue naming the CPT that
+     appears billed without support.
+   - **Overlapping / duplicate charges**: two or more CPTs billed on
+     the same session that represent the same underlying service
+     (e.g. 97110 therapeutic exercise AND 97150 group therapy on the
+     same visit — these should not co-occur; the practice must pick one
+     based on how the service was actually delivered). Emit a
+     `charge_alignment` issue describing the overlap.
+
+   You are FLAGGING for a human biller to review, NOT suggesting code
+   substitutions. Describe what the note says and what the charge list
+   shows; the biller reconciles.
+
+CRITICAL — LITERAL BLANK PLACEHOLDERS ARE FAILS. DO NOT INFER.
+
+If a section contains a literal blank placeholder — a sequence of
+underscores (`___`, `______`), an empty fill-in-the-blank slot, "TBD",
+"[blank]", or any similar placeholder where a specific detail should
+appear (region, level, injection site, medication, dose, technique,
+procedure specifics) — treat that field as UNFILLED, i.e. missing
+documentation.
+
+DO NOT:
+- Infer the intended value from surrounding paragraphs, headings,
+  systems review, or other context in the note.
+- Rationalize a pass by writing "context indicates X was treated" or
+  "surrounding paragraphs imply Y" or "based on the visit type it was
+  probably Z." The doctor's job is to fill that field; the reviewer's
+  job is to catch when they didn't.
+- Treat a section as complete just because the paragraphs around the
+  blank exist and are detailed.
+
+DO:
+- Flag the specific blank as an `area_documentation` issue naming the
+  exact field left empty (e.g. "injection site", "adjusted levels",
+  "medication dose").
+- Downgrade `primary_treatment.present` to `false` when a critical
+  treatment detail is left as a blank placeholder — the section is
+  incomplete, not merely thin.
+- Return a `fail` verdict when a required section contains an unfilled
+  placeholder for a load-bearing detail (injection site, medication,
+  region treated, level adjusted, procedure specifics, etc.).
+
+Example that MUST fail: "3 trigger points identified at ______ ...
+solution 1% lidocaine 2cc + 1cc 40mg Depo Medrol". The medication and
+dose are specified but the injection site is blank. Do NOT infer the
+site from a systems-review or subjective paragraph — the site belongs
+in this section and it is unfilled.
+
 EXPLICITLY OUT OF SCOPE — DO NOT FLAG:
 
-- **Billing/coding decisions.** Do not suggest a different CPT code, do not
-  comment on whether the regions documented match a specific CPT's region
-  count, do not propose substitutions. The biller's code selection is fixed.
+- **CPT code substitutions.** Do not suggest a different CPT code, do not
+  propose a specific replacement. You may FLAG a documented↔billed mismatch
+  (see rule 4 above) but the biller decides how to reconcile it.
 - **Clinical effectiveness or progression.** Do not judge whether the
   treatment is "working", whether pain scores changed, whether the patient
   has improved. Only flag a progression issue if the focal note CONTRADICTS
@@ -69,9 +131,9 @@ Be precise. Cite specific section names in your issues. Distinguish
 "missing" (absent from the focal note) from "weak" (mentioned but thin) —
 only the first is a fail-worthy gap by itself.
 
-When emitting issues, the only categories that should appear are:
-`required_section`, `diagnosis_coverage`, `area_documentation`. Do NOT emit
-`charge_alignment` or `cloned_documentation` issues — leave those arrays
-empty.
+When emitting issues, use these categories:
+`required_section`, `diagnosis_coverage`, `area_documentation`,
+`charge_alignment`. Do NOT emit `cloned_documentation` issues — leave that
+array empty.
 
 Return your analysis ONLY via the submit_scrub_findings tool.

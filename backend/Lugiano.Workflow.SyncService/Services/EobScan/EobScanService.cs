@@ -8,24 +8,20 @@ using Microsoft.Extensions.Logging;
 
 namespace Lugiano.Workflow.SyncService.Services.EobScanning;
 
-// Orchestrator for EOB scan processing. Owns the full pipeline:
-//   1. Save uploaded PDF to disk
-//   2. Create an EobScan row in queued state
-//   3. Kick off background processing (fire-and-forget Task — for production
-//      we'd move this to a hosted service or background queue, but this is
-//      fine for the demo since scans take <2 min)
-//   4. Split PDF into overlapping chunks
-//   5. Fan chunks out to Claude in parallel (concurrency-capped)
-//   6. Dedupe results across overlap regions
-//   7. Backfill missing reason-code descriptions from sibling rows
-//   8. Persist checks + line items + token cost in one transaction
-//   9. Flip scan status to completed (or failed with error)
+// Orchestrator for EOB scan processing: save PDF, queue row, fire-and-forget
+// background run (fine for the demo since scans take <2 min; move to a hosted
+// service/queue for production), split into overlapping chunks, fan out to
+// Claude in parallel, dedupe across overlaps, backfill reason descriptions,
+// persist in one transaction, flip status to completed/failed.
 public sealed class EobScanService
 {
-    private const int ChunkSize = 15;
+    // Bumped 15 → 25 on 2026-07-02 (7/1 cost tuning). Bigger chunks = fewer
+    // API calls = less per-call fixed overhead. A dense 25-page LM lockbox
+    // chunk produces ~8-12K output tokens, well under the 32K max_tokens cap.
+    private const int ChunkSize = 25;
     private const int ChunkOverlap = 2;
-    // Anthropic concurrency cap — be polite. Sonnet 4.5 ~$0.50/min throughput
-    // at this concurrency on a typical EOB scan.
+    // Anthropic concurrency cap. Sonnet 4.5 ~$0.50/min throughput at this
+    // concurrency on a typical EOB scan.
     private const int MaxParallelChunks = 4;
     // Sonnet 4.5: $3/MTok in, $15/MTok out.
     private const decimal CostInputPerMTok = 3.00m;
@@ -50,9 +46,8 @@ public sealed class EobScanService
 
     public async Task<EobScan> StartScanAsync(Stream pdfContent, string originalFilename, CancellationToken ct = default)
     {
-        // Persist the PDF to a stable location so we can re-run + audit later.
-        // Foldered by scan-date-from-filename (falls back to today) so a year
-        // of runs stays organized instead of a flat 400-file directory.
+        // Persist the PDF for re-run + audit, foldered by scan-date-from-filename
+        // (falls back to today) so runs stay organized instead of one flat dir.
         var scanDate = TryParseScanDate(originalFilename) ?? DateTime.UtcNow;
         var dayFolder = scanDate.ToString("MMddyy");
         var scanStorageDir = Path.Combine(ResolveScanStorageDir(), dayFolder);
@@ -117,17 +112,11 @@ public sealed class EobScanService
                 "EOB scan {ScanId} ({Filename}): {Pages} pages → {Chunks} chunks of {ChunkSize}±{Overlap}",
                 scanId, scan.SourceFilename, scan.PageCount, chunks.Count, ChunkSize, ChunkOverlap);
 
-            // Fan out chunks with a concurrency cap. SemaphoreSlim is the
-            // canonical .NET pattern for "N at a time" without third-party deps.
-            // Per-chunk start/finish logs surface progress while a multi-minute
-            // run is in flight — without them, the console sits silent and
-            // there's no way to tell a stuck chunk from a slow one.
-            //
-            // Chunk failures are NON-FATAL — a transient 429 / timeout / API
-            // hiccup on one chunk shouldn't destroy 30+ minutes of successful
-            // work on the other 34 chunks. Failed chunks are logged loud and
-            // clear, results[idx] stays null, and the merge/persist path
-            // simply skips nulls.
+            // Fan out chunks with a SemaphoreSlim concurrency cap. Per-chunk
+            // logs surface progress during a multi-minute run.
+            // Chunk failures are NON-FATAL — a transient 429/timeout on one
+            // chunk shouldn't destroy successful work on the others. Failed
+            // chunks are logged, results[idx] stays null, merge/persist skips nulls.
             using var sem = new SemaphoreSlim(MaxParallelChunks);
             var results = new EobExtractionResult?[chunks.Count];
             var chunkErrors = new List<string>();
@@ -163,10 +152,8 @@ public sealed class EobScanService
                         {
                             sw.Stop();
                             Interlocked.Increment(ref failedCount);
-                            // LogError renders in red in the console and
-                            // captures the full stack trace. Include the
-                            // chunk range so the operator can pinpoint which
-                            // pages need a rerun.
+                            // Include the chunk range so the operator can
+                            // pinpoint which pages need a rerun.
                             _logger.LogError(chunkEx,
                                 "⚠️  EOB scan {ScanId} chunk {Idx}/{Total} (pp{Start}-{End}) FAILED after {Sec:F1}s — continuing with remaining chunks. Error: {ErrorMessage}",
                                 scanId, idx + 1, chunks.Count, c.StartPage, c.EndPage,
@@ -175,7 +162,6 @@ public sealed class EobScanService
                             {
                                 chunkErrors.Add($"pp{c.StartPage}-{c.EndPage}: {chunkEx.Message}");
                             }
-                            // results[idx] stays null — merge skips it.
                         }
                     }
                     finally { sem.Release(); }
@@ -193,8 +179,6 @@ public sealed class EobScanService
                     scanId, failedCount, chunks.Count, chunks.Count - failedCount,
                     string.Join(", ", chunkErrors.Take(5)));
 
-            // Merge + dedupe. Skips nulls from failed chunks automatically
-            // because the enumeration only yields non-null results.
             var (dedupedChecks, dedupedLines) = MergeAndDedupe(results);
             BackfillReasonDescriptions(dedupedLines);
 
@@ -203,22 +187,42 @@ public sealed class EobScanService
             int outTok = results.Where(r => r is not null).Sum(r => r!.OutputTokens);
             var cost = (inTok * CostInputPerMTok + outTok * CostOutputPerMTok) / 1_000_000m;
 
-            // Persist children — single transaction, simple to reason about.
+            // Score checks for hallucination + duplicate patterns before persist
+            // so DB rows land pre-tagged. Rules validated on the 7/1/2026
+            // reconciliation — see CheckConfidenceScorer for the pattern list.
+            var scoredChecks = dedupedChecks.Select(c => new EobScanCheck
+            {
+                EobScanId = scanId,
+                PageNumber = c.PageNumber,
+                CheckNumber = c.CheckNumber,
+                CheckDate = c.CheckDate,
+                Amount = c.Amount,
+                Payer = c.Payer,
+                Administrator = c.Administrator,
+            }).ToList();
+            // Build the isolation set from THIS scan's line items so the scorer
+            // can catch checks with no downstream line items (a strong hallucination
+            // signal — Explanation-of-Review misreads, CC pages, endorsement
+            // backers). Whitespace/case-insensitive comparison so "1 13 172377 J"
+            // on the check matches "113172377J" as the linkage on line items.
+            var isolationSet = new HashSet<string>(
+                dedupedLines
+                    .Where(l => !string.IsNullOrWhiteSpace(l.CheckNumber))
+                    .Select(l => new string(l.CheckNumber!.Where(ch => !char.IsWhiteSpace(ch)).ToArray()).ToUpperInvariant()),
+                StringComparer.Ordinal);
+            CheckConfidenceScorer.Score(scoredChecks, isolationSet);
+            var tierTotals = CheckConfidenceScorer.ComputeTotals(scoredChecks);
+            _logger.LogInformation(
+                "EOB scan {ScanId} check reconciliation: {H} high (${HA:N2}) + {M} medium (${MA:N2}) + {L} low (${LA:N2}) → clean total ${CT:N2} (raw ${RT:N2})",
+                scanId, tierTotals.HighCount, tierTotals.HighAmount, tierTotals.MediumCount, tierTotals.MediumAmount,
+                tierTotals.LowCount, tierTotals.LowAmount, tierTotals.CleanTotal, tierTotals.RawTotal);
+
             await using var tx = await db.Database.BeginTransactionAsync();
             try
             {
-                foreach (var c in dedupedChecks)
+                foreach (var c in scoredChecks)
                 {
-                    db.EobScanChecks.Add(new EobScanCheck
-                    {
-                        EobScanId = scanId,
-                        PageNumber = c.PageNumber,
-                        CheckNumber = c.CheckNumber,
-                        CheckDate = c.CheckDate,
-                        Amount = c.Amount,
-                        Payer = c.Payer,
-                        Administrator = c.Administrator,
-                    });
+                    db.EobScanChecks.Add(c);
                 }
                 foreach (var l in dedupedLines)
                 {
@@ -271,25 +275,21 @@ public sealed class EobScanService
         }
     }
 
-    // Merge results from overlapping chunks. A check or line that appears in
-    // two adjacent chunks (because of the page-overlap) should only land in
-    // the DB once. Dedupe key is intentionally tight enough to catch
-    // re-extractions while loose enough to keep the Sedgwick/Indemnity pairs
-    // distinct (different check numbers → different rows).
+    // Merge overlapping chunks so a check/line appearing in two adjacent
+    // chunks lands in the DB once. Keys are tight enough to catch
+    // re-extractions but keep Sedgwick/Indemnity pairs distinct.
     private static (List<EobExtractedCheck> checks, List<EobExtractedLineItem> lines) MergeAndDedupe(
         IReadOnlyList<EobExtractionResult?> results)
     {
-        // Dedupe key intentionally EXCLUDES page number. Same check on adjacent
-        // overlapping chunks often lands with slightly different page numbers
-        // (Claude drifts by ±1 at chunk boundaries when a blank/duplex back
-        // page is present); if we included page in the key those would each
-        // survive as separate rows. Check number + amount is enough — two
-        // distinct checks with the same amount get different check numbers.
+        // Check key EXCLUDES page number: Claude drifts ±1 at chunk boundaries
+        // (blank/duplex back pages), so including page would keep dupes as
+        // separate rows. Check number + amount is enough — distinct checks with
+        // the same amount get different check numbers.
         var checkSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var checks = new List<EobExtractedCheck>();
         foreach (var r in results)
         {
-            if (r is null) continue;  // failed chunk, skipped
+            if (r is null) continue;
             foreach (var c in r.Checks)
             {
                 var key = $"{c.CheckNumber}|{c.Amount}";
@@ -297,23 +297,12 @@ public sealed class EobScanService
             }
         }
 
-        // Line-item dedupe key uses NORMALIZED patient name + NORMALIZED DOS
-        // + CPT + billed + paid. Rationale, validated 6/30/2026 against 4/22
-        // ground truth:
-        //   1. Patient names vary across chunks — "WASHINGTON, TAAZ" vs
-        //      "TAAZ WASHINGTON" vs "WASHINGTON , TAAZ" all mean the same
-        //      person. NormalizePatient uppercases, strips punctuation, and
-        //      sorts tokens so all three collapse.
-        //   2. Service dates vary too — "04/02/2026" vs "4/2/26" vs
-        //      "2026-04-02". NormalizeDate parses these to a canonical
-        //      yyyy-MM-dd string.
-        //   3. Claim numbers vary MORE than the above because they're often
-        //      small print in dense layouts — same claim appears as
-        //      "4263-661215", "4A251132YTF-0001", "4263-561221" across
-        //      chunks. Including claim in the key WOULD force these to
-        //      separate rows even though they're the same visit. Dropping
-        //      claim from the key is the right trade-off — the amounts +
-        //      CPT + patient + DOS uniquely identify a line.
+        // Line-item key = normalized patient + normalized DOS + CPT + billed
+        // + paid. Validated: 4/22 non-lockbox 253 vs vendor's 248 (within 2%);
+        // 7/2 LM lockbox needs DOS in key — every LM line is $0 paid, so
+        // dropping DOS collapsed 30+ visits into one row (scan #11: 200 vs
+        // vendor's 1,027). Name/DOS normalized to absorb OCR variance; claim
+        // numbers stay OUT (small print, reads 3-4 ways across chunks).
         var lineSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var lines = new List<EobExtractedLineItem>();
         foreach (var r in results)
@@ -321,24 +310,13 @@ public sealed class EobScanService
             if (r is null) continue;
             foreach (var l in r.LineItems)
             {
-                // Defensive filter — drop check-total / period-summary rows
-                // Claude occasionally extracts as line items. These have empty
-                // or non-CPT procedure codes ("DOCTOR", "TOTAL", ""), or a
-                // DOS "range" ("03/06/2026 - 03/09/2026") indicating an
-                // aggregated period rather than a single service line.
-                // Validated 6/30/2026 on the 4/22 non-lockbox scan: this
-                // filter drops 52 phantom rows and brings the Paid total
-                // from 42% over vendor to within 2% of vendor.
+                // Drop check-total / period-summary rows Claude sometimes
+                // emits (empty/non-CPT code, or a DOS range). Validated
+                // 6/30/2026 on 4/22 non-lockbox: drops 52 phantom rows, Paid
+                // total 42% over → within 2% of vendor.
                 if (!IsRealServiceLine(l)) continue;
 
-                // ServiceDate DELIBERATELY EXCLUDED — validated 6/30/2026
-                // by simulating 6 dedupe strategies on 458-row scan #9:
-                //   with DOS in key    → 458 rows, $10,656 paid (199% over)
-                //   without DOS in key → 205 rows,  $5,229 paid (98% of $5,358)
-                // Trade-off: recurring visits with same patient+CPT+$ collapse
-                // into one row. Acceptable — the alternative was 2× over on the
-                // Paid total which the billing team scrutinizes most.
-                var key = $"{NormalizePatient(l.PatientName)}|{l.ProcedureCode}|{l.Billed}|{l.Paid}";
+                var key = $"{NormalizePatient(l.PatientName)}|{NormalizeDate(l.ServiceDate)}|{l.ProcedureCode}|{l.Billed}|{l.Paid}";
                 if (lineSeen.Add(key)) lines.Add(l);
             }
         }
@@ -347,11 +325,10 @@ public sealed class EobScanService
                 lines.OrderBy(l => l.PageNumber).ThenBy(l => l.ProcedureCode).ToList());
     }
 
-    // Claude shortcuts reason-code descriptions when the same code repeats
-    // across many lines (we observed XXU00 and XXG15 lose descriptions on
-    // the 50-page spike run). Backfill: for any code that appears with a
-    // description anywhere in the scan, fill in that description on every
-    // OTHER occurrence in the same scan that's missing one.
+    // Claude shortcuts reason-code descriptions when a code repeats (seen with
+    // XXU00/XXG15 on the 50-page spike run). Backfill: for any code that has a
+    // description somewhere in the scan, fill it in on every other occurrence
+    // that's missing one.
     private static void BackfillReasonDescriptions(List<EobExtractedLineItem> lines)
     {
         var codeToDesc = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -381,23 +358,19 @@ public sealed class EobScanService
         }
     }
 
-    // Reject phantom "line items" that Claude sometimes emits from
-    // check-total, subtotal, or period-summary blocks in the EOB layout.
-    // Real CPT/HCPCS codes start with either 5 digits or 1 letter + 4 digits
-    // (modifier junk after the head is fine — we only check the leading 5
-    // chars). A CPT of empty / DOCTOR / TOTAL / SUBTOTAL / SUMMARY /
-    // PATIENT / a bare DOS range are the specific patterns seen in real
-    // scans.
+    // Reject phantom "line items" from check-total/subtotal/period-summary
+    // blocks. Real CPT/HCPCS codes start with 5 digits or 1 letter + 4 digits
+    // (modifiers after the leading 5 chars are fine). Empty / DOCTOR / TOTAL /
+    // SUBTOTAL / SUMMARY / PATIENT / bare DOS range are the seen patterns.
     private static bool IsRealServiceLine(EobExtractedLineItem l)
     {
         var cpt = (l.ProcedureCode ?? string.Empty).Trim();
         if (cpt.Length < 5) return false;
-        // Word-shaped non-CPT values
         var upper = cpt.ToUpperInvariant();
         string[] badWords = { "DOCTOR", "TOTAL", "SUBTOTAL", "SUMMARY", "PATIENT", "CHECK" };
         foreach (var w in badWords)
             if (upper == w || upper.StartsWith(w + " ")) return false;
-        // First 5 chars must look like a code head (5 digits, or 1 letter + 4 digits)
+        // First 5 chars must be a code head: 5 digits, or 1 letter + 4 digits
         var head = cpt.Substring(0, 5).ToUpperInvariant();
         var isFiveDigits = head.All(char.IsDigit);
         var isAlphaPlus4 = char.IsLetter(head[0]) && head.AsSpan(1).ToArray().All(char.IsDigit);
@@ -408,12 +381,10 @@ public sealed class EobScanService
         return true;
     }
 
-    // Canonicalize a patient name for dedupe: uppercase, strip
-    // punctuation, sort tokens alphabetically. Handles the three OCR
-    // variance patterns we've seen — case ("Sanchez-Lopez" vs "SANCHEZ-LOPEZ"),
-    // token order ("WASHINGTON, TAAZ" vs "TAAZ WASHINGTON"), and stray
-    // punctuation/whitespace ("WASHINGTON , TAAZ"). Hyphens are preserved
-    // so "SANCHEZ-LOPEZ" doesn't collide with "SANCHEZ" or "LOPEZ".
+    // Canonicalize a patient name for dedupe: uppercase, strip punctuation,
+    // sort tokens. Absorbs case, token-order, and stray-punctuation OCR
+    // variance. Hyphens preserved so "SANCHEZ-LOPEZ" doesn't collide with
+    // "SANCHEZ" or "LOPEZ".
     private static string NormalizePatient(string? name)
     {
         if (string.IsNullOrWhiteSpace(name)) return "";
@@ -431,11 +402,9 @@ public sealed class EobScanService
         return string.Join(' ', tokens);
     }
 
-    // Parse a wide range of date formats to yyyy-MM-dd. Claude reports the
-    // same date differently across chunks ("04/02/2026", "4/2/26",
-    // "April 2, 2026", "2026-04-02") — this collapses them to a canonical
-    // form for the dedupe key. Falls back to the trimmed uppercase original
-    // if parsing fails so unrecognizable formats still self-match.
+    // Parse many date formats to yyyy-MM-dd so the same date reported
+    // differently across chunks collapses in the dedupe key. Falls back to the
+    // trimmed uppercase original so unrecognizable formats still self-match.
     private static string NormalizeDate(string? dos)
     {
         if (string.IsNullOrWhiteSpace(dos)) return "";
@@ -485,10 +454,9 @@ public sealed class EobScanService
         return null;
     }
 
-    // Default: C:\ProgramData\Lugiano\EobScans (persistent, survives user
-    // profile purges, standard Windows service-owned data location). Override
-    // via EobScan:StorageDir in config for other envs (D:\ drive, custom
-    // path, etc.).
+    // Default: C:\ProgramData\Lugiano\EobScans (persistent, survives profile
+    // purges, standard Windows service-owned data location). Override via
+    // EobScan:StorageDir in config.
     private string ResolveScanStorageDir() =>
         _config["EobScan:StorageDir"]
         ?? Path.Combine(

@@ -43,12 +43,17 @@ public sealed class Worker : BackgroundService
         {
             var insurance = await _insurance.ProcessAsync(ct);
             var chartNotes = await _chartNotes.ProcessAsync(ct);
+            // Second chart-note pass: catch notes that were EDITED/re-signed
+            // after we first captured them (their ID never changes, so the
+            // ProcessAsync ID-cursor above can't see them). Driven off the CN
+            // signature clock.
+            var notesRefreshed = await _chartNotes.ReconcileRecentlySignedAsync(ct);
 
             _logger.LogInformation(
                 "Cycle complete. Insurance: found={InsFound}, casesTouched={InsCases}, events={InsEvents}. " +
-                "ChartNotes: found={NoteFound}, casesTouched={NoteCases}, events={NoteEvents}.",
+                "ChartNotes: found={NoteFound}, casesTouched={NoteCases}, events={NoteEvents}, refreshed={NoteRefreshed}.",
                 insurance.Found, insurance.CasesTouched, insurance.EventsCreated,
-                chartNotes.Found, chartNotes.CasesTouched, chartNotes.EventsCreated);
+                chartNotes.Found, chartNotes.CasesTouched, chartNotes.EventsCreated, notesRefreshed);
 
             foreach (var state in await _syncState.GetAllAsync())
                 _logger.LogInformation("SyncState[{Key}] = {LastSeenId} (updated {UpdatedAt:u}).",

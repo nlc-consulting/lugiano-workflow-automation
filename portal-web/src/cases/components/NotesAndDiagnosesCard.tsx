@@ -50,6 +50,10 @@ type NoteRow = NoteVisit & {
   noteDate?: string | null
   doctor?: string | null
   plainText?: string | null
+  // Colored/bold runs from the note RTF (paragraphs of runs) — matches
+  // ChiroTouch's blue/red formatting. Null when the note isn't RTF; render
+  // plainText then.
+  richBody?: RtfRun[][] | null
   diagnoses?: DiagnosisItem[] | null
   // Pre-formatted clinic-local signing timestamp (chart notes only). Null for
   // unsigned notes and portal corrections.
@@ -58,6 +62,43 @@ type NoteRow = NoteVisit & {
 }
 
 type DiagnosisItem = { code: string; description?: string | null }
+
+// One styled span of note text (from the backend RTF rich converter).
+type RtfRun = { text: string; colorHex: string; bold: boolean }
+
+// Renders a note body from colored/bold runs (paragraphs of runs), mirroring
+// ChiroTouch's on-screen formatting. Empty paragraphs render as blank lines.
+const RichNoteBody = ({ paragraphs }: { paragraphs: RtfRun[][] }) => (
+  <Box
+    sx={{
+      bgcolor: 'action.hover',
+      p: 2,
+      borderRadius: 1,
+      maxHeight: 600,
+      overflowY: 'auto',
+      fontSize: 13,
+      lineHeight: 1.5,
+    }}
+  >
+    {paragraphs.map((para, i) =>
+      para.length === 0 ? (
+        <Box key={i} sx={{ height: 10 }} />
+      ) : (
+        <Box key={i} component="p" sx={{ m: 0, mb: 0.5 }}>
+          {para.map((run, j) => (
+            <Box
+              key={j}
+              component="span"
+              sx={{ color: run.colorHex, fontWeight: run.bold ? 700 : 400 }}
+            >
+              {run.text}
+            </Box>
+          ))}
+        </Box>
+      ),
+    )}
+  </Box>
+)
 
 const SCRUB_LABELS: Record<string, string> = {
   pass: 'Pass',
@@ -287,7 +328,9 @@ const NotesAndDiagnosesCard = () => {
                       )}
                     </Box>
                   </Box>
-                  {currentNote.plainText ? (
+                  {currentNote.richBody && currentNote.richBody.length > 0 ? (
+                    <RichNoteBody paragraphs={currentNote.richBody} />
+                  ) : currentNote.plainText ? (
                     <Box
                       sx={{
                         whiteSpace: 'pre-wrap',

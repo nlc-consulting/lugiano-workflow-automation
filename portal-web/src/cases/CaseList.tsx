@@ -116,6 +116,29 @@ const OutstandingChargesChip = ({ row }: { row: CaseRecord }) => {
   )
 }
 
+// Billable visits with charges but no corresponding chart note. Non-zero
+// means the biller has documentation gaps to chase — a treating doctor
+// entered charges but never wrote up the visit. Hidden (empty cell) when
+// count is 0 so clean patients don't add visual noise.
+const MissingNotesChip = ({ row }: { row: CaseRecord }) => {
+  const n = row.missingNoteVisitCount ?? 0
+  if (n === 0) return null
+  return (
+    <Tooltip
+      title={`${n} billable visit${n === 1 ? '' : 's'} with charges but no chart note`}
+      arrow
+    >
+      <Chip
+        size="small"
+        color="warning"
+        variant="filled"
+        label={`${n} missing`}
+        sx={{ fontWeight: 600 }}
+      />
+    </Tooltip>
+  )
+}
+
 // Case-level scrub status. One verdict per case — no coverage math, no
 // partial state. Either the case has been scrubbed or it hasn't, and if it
 // has the verdict is the whole-bundle judgment. Unscrubbed cases read as
@@ -279,6 +302,11 @@ const CaseList = () => (
       <FunctionField
         label="To bill"
         render={(r: CaseRecord) => <OutstandingChargesChip row={r} />}
+      />
+      <FunctionField
+        label="Missing notes"
+        sortBy="missingNoteVisitCount"
+        render={(r: CaseRecord) => <MissingNotesChip row={r} />}
       />
       <TextField source="currentState" label="State" />
       <EstDateTimeField source="addedAt" label="Added" />

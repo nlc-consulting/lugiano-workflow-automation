@@ -41,7 +41,6 @@ public sealed class NotesPreviewService
         var policies = await _detail.GetPoliciesAsync(patientId);
         var noteRows = await _detail.GetRecentNotesAsync(patientId, 100);
 
-        // Apply optional date filter.
         var filtered = noteRows
             .Where(n => n.NoteDate.HasValue)
             .Where(n => from is null || n.NoteDate >= from)
@@ -49,10 +48,8 @@ public sealed class NotesPreviewService
             .OrderByDescending(n => n.NoteDate)
             .ToList();
 
-        // Pull plain-text bodies for each note. Worker caches PlainText on
-        // DoctorNote during sync, but the GetRecentNotesAsync ChartNoteRow
-        // doesn't include text — we need a separate trip. For unsynced or
-        // pre-cache rows, fall back to a live RTF read.
+        // ChartNoteRow from GetRecentNotesAsync doesn't carry note text, so
+        // bodies come via a separate RTF read (below) for unsynced/pre-cache rows.
         var phoneNumber = await GetPrimaryPhoneAsync(patientId);
         var visitIds = filtered.Where(n => n.VisitId.HasValue).Select(n => n.VisitId!.Value).Distinct().ToList();
         var diagnosesByVisit = visitIds.Count == 0
@@ -61,8 +58,8 @@ public sealed class NotesPreviewService
                 .GroupBy(d => d.AppointmentId)
                 .ToDictionary(g => g.Key, g => g.Select(d => $"{d.Code} {d.Description}").ToList());
 
-        // Signature image + signed timestamp per note, so the standalone notes
-        // PDF carries the same "Electronically Signed" block as the fax/HCFA flow.
+        // Signature image + timestamp per note, so this PDF carries the same
+        // "Electronically Signed" block as the fax/HCFA flow.
         var sigByNote = await GetSignaturesAsync(filtered.Select(n => n.Id).ToArray());
 
         var notes = new List<NotePageData>();

@@ -39,7 +39,7 @@ public sealed class HcfaPreviewService
     {
         await using var conn = _sourceDb.Create();
 
-        // 1. Patient demographics + insurance + appointment + doctor in one round-trip.
+        // Patient demographics + insurance + appointment + doctor in one round-trip.
         const string headerSql =
             """
             SELECT
@@ -122,7 +122,7 @@ public sealed class HcfaPreviewService
             headerSql, new { patientId, appointmentId });
         if (header is null) return null;
 
-        // 2. Diagnoses for this appointment, in seq order (A..L on the form).
+        // Diagnoses for this appointment, in seq order (A..L on the form).
         var dxRows = (await conn.QueryAsync<HcfaDxRow>(
             """
             SELECT TOP 12 Code, Description, Seq
@@ -132,10 +132,9 @@ public sealed class HcfaPreviewService
             """,
             new { appointmentId })).ToList();
 
-        // 3. Service lines for this appointment (CPT charges only).
-        //    DiagnosisPointer/Modifiers don't live on Transactions for unbilled
-        //    charges — they're populated on ClaimLines at claim-generation time.
-        //    Default pointer to "1" + blank modifiers for the preview.
+        // Service lines for this appointment (CPT charges only). DiagnosisPointer/
+        // Modifiers aren't on Transactions for unbilled charges (they're set on
+        // ClaimLines at claim-generation), so default pointer "1" + blank modifiers.
         var lineRows = (await conn.QueryAsync<HcfaLineRow>(
             """
             SELECT ID         AS TranId,
@@ -159,9 +158,8 @@ public sealed class HcfaPreviewService
             return null;
         }
 
-        // 4. Chart note(s) for this appointment's DOS. ChartNotes has no
-        //    AppointmentID, so match by (PatientID + same calendar date).
-        //    Usually one note per visit; multi-provider visits can have more.
+        // Chart note(s) for this DOS. ChartNotes has no AppointmentID, so match
+        // by (PatientID + same calendar date). Multi-provider visits can have more.
         var noteHeaders = (await conn.QueryAsync<ChartNoteHeader>(
             """
             SELECT cn.ID AS NoteId, cn.NoteDate, cn.SOAPPtr AS TextPtr,
@@ -174,11 +172,9 @@ public sealed class HcfaPreviewService
             """,
             new { patientId, dos = header.AppointmentDateTime ?? DateTime.Today })).ToList();
 
-        // Signature lookup: prefer the row signed against THIS specific
-        // ChartNote (SigType='CN' + SigTypeID=noteId — CT's polymorphic key),
-        // fall back to the doctor's most recent signature image so portal-
-        // generated notes (which may not have a per-note signature row yet)
-        // still render with the doctor's mark.
+        // Prefer the row signed against THIS ChartNote (SigType='CN' + SigTypeID=noteId,
+        // CT's polymorphic key); fall back to the doctor's latest signature so
+        // portal-generated notes without a per-note row still get the doctor's mark.
         var noteIds = noteHeaders.Select(n => n.NoteId).ToArray();
         var perNoteSigs = noteIds.Length == 0
             ? new Dictionary<int, SigRow>()
@@ -212,9 +208,8 @@ public sealed class HcfaPreviewService
                         ptr, nh.NoteId);
                 }
             }
-            // Per-note signature first; fall back to whatever this doctor has
-            // signed most recently. Avoids a blank signature line when CT's
-            // CN row exists but ImageBase64 was never populated.
+            // Per-note signature first, else the doctor's most recent — avoids a
+            // blank signature line when CT's CN row exists but ImageBase64 is null.
             string? sigImage = null;
             DateTime? signedAt = null;
             if (perNoteSigs.TryGetValue(nh.NoteId, out var sig))
@@ -245,36 +240,27 @@ public sealed class HcfaPreviewService
 
     public byte[] RenderPdf(HcfaData data, bool calibrate = false, float dx = 0, float dy = 0, bool fax = false)
     {
-        // QuestPDF requires a license declaration at runtime. Community license
-        // covers orgs under $1M revenue — fits Lugiano. Set once is fine.
+        // Community license covers orgs under $1M revenue — fits Lugiano.
         QuestPDF.Settings.License = LicenseType.Community;
         return Document.Create(doc => AddPagesToDocument(doc, data, calibrate, dx, dy, fax)).GeneratePdf();
     }
 
-    // Adds this HCFA's pages (form + chart notes) onto an existing document
-    // container. Used by the tracer endpoint to interleave HCFA forms after
-    // each tracer batch page — see TracerController.Preview. Caller owns the
-    // Document.Create wrapper and QuestPDF.Settings.License set-up.
+    // Adds this HCFA's pages (form + chart notes) onto an existing document.
+    // Used by the tracer endpoint to interleave HCFA forms after each tracer
+    // batch page (see TracerController.Preview). Caller owns Document.Create
+    // and the QuestPDF.Settings.License set-up.
     public void AddPagesToDocument(IDocumentContainer doc, HcfaData data,
         bool calibrate = false, float dx = 0, float dy = 0, bool fax = false)
     {
-        // Print-mode rendering with ABSOLUTE positioning. Coordinates were
-        // measured from a real filled CMS-1500 (Good2Go claim 2024-58949,
-        // patient Ortiz Zapata, faxed 12/30/25) via pdftotext -bbox-layout.
-        // Numbers are PDF points (1pt = 1/72") from the top-left of an
-        // 8.5×11 letter page. Each field's (x, y) corresponds to the start
-        // of the text glyph in the matching pre-printed box on red paper.
-        //
-        // calibrate=true overlays tiny markers + box labels at each field
-        // position so the user can print on plain paper, hold against a real
-        // form, and verify alignment. Use ?calibrate=true on the endpoint.
-        //
-        // fax=true composites a color CMS-1500 (02-12) form image as the
-        // page background, so the carrier receives a complete-looking form
-        // via fax. The data coordinates are the same in both modes — CT uses
-        // one alignment for mail + fax, and we match that. The overlay PNG is
-        // sized to the full letter page; if the boxes don't line up under the
-        // data the PNG needs re-rasterizing, not separate coordinates.
+        // ABSOLUTE positioning in PDF points (1pt=1/72") from page top-left.
+        // Coordinates measured from a real filled CMS-1500 (Good2Go claim
+        // 2024-58949, patient Ortiz Zapata, faxed 12/30/25) via pdftotext
+        // -bbox-layout; each (x,y) is the glyph start in the pre-printed box.
+        // calibrate=true overlays markers + box labels for plain-paper alignment
+        // checks. fax=true composites a color CMS-1500 (02-12) background so the
+        // carrier gets a complete-looking form. Coordinates are identical in both
+        // modes (CT uses one alignment for mail + fax); if the overlay boxes don't
+        // line up, re-rasterize the PNG rather than adding separate coordinates.
         var fields = BuildFieldList(data);
         var overlayPath = fax ? ResolveOverlayPath() : null;
 
@@ -287,14 +273,11 @@ public sealed class HcfaPreviewService
 
                 page.Content().Layers(layers =>
                 {
-                    // Primary layer is empty (transparent) — we just need a
-                    // canvas for the absolutely-positioned children.
+                    // Empty transparent canvas for the absolutely-positioned children.
                     layers.PrimaryLayer().Width(612).Height(792);
 
-                    // Fax overlay: blank CMS-1500 form rendered underneath
-                    // the data so the recipient sees a complete form. Added
-                    // BEFORE the field layers so text sits on top of the
-                    // form lines (matching CT's fax output).
+                    // Fax overlay: blank CMS-1500 form under the data. Added BEFORE
+                    // the field layers so text sits on top of the form lines (matches CT).
                     if (overlayPath is not null)
                     {
                         layers.Layer().AlignLeft().AlignTop()
@@ -304,10 +287,8 @@ public sealed class HcfaPreviewService
 
                     foreach (var f in fields)
                     {
-                        // Apply per-printer global offsets (dx, dy in PDF points).
-                        // Standard pattern: every CMS-1500 product uses two
-                        // calibration numbers per printer to compensate for
-                        // margin + scaling differences. Dial once, persist later.
+                        // Per-printer global offsets (dx, dy in PDF points) to
+                        // compensate for margin + scaling differences. Dial once.
                         var x = Math.Max(0, f.X + dx);
                         var y = Math.Max(0, f.Y + dy);
 
@@ -317,8 +298,7 @@ public sealed class HcfaPreviewService
 
                         if (calibrate)
                         {
-                            // Tiny grey label one line above the value showing
-                            // the box id — only renders in ?calibrate=true mode.
+                            // Grey box-id label above each value (?calibrate=true only).
                             layers.Layer().AlignLeft().AlignTop()
                                 .PaddingLeft(x).PaddingTop(Math.Max(0, y - 6))
                                 .Text(f.BoxId).FontSize(5).FontColor(Colors.Grey.Medium);
@@ -328,9 +308,8 @@ public sealed class HcfaPreviewService
             });
 
             // ---- PAGE 2+: chart notes for this DOS ----
-            // Delegated to the shared renderer so the printed/faxed chart-note
-            // format + signature block are identical across every flow and match
-            // ChiroTouch's output. See ChartNotesRenderer.
+            // Delegated to ChartNotesRenderer so the note format + signature block
+            // stay identical across every flow and match ChiroTouch's output.
             var ctx = new ChartNoteHeaderCtx(
                 PatientDisplayName: data.Header.PatientDisplayName,
                 AccountNo: data.Header.AccountNo?.ToString() ?? data.Header.PatientId.ToString(),
@@ -350,10 +329,9 @@ public sealed class HcfaPreviewService
                 SignedAt: n.SignedAt)));
     }
 
-    // Build the absolutely-positioned field list for one claim. Coordinates
-    // are PDF points from page top-left, derived from the Good2Go reference
-    // claim that we know prints correctly on real CMS-1500 paper. Tweak per
-    // printer via the ?calibrate=true overlay.
+    // Absolutely-positioned field list for one claim. Coordinates (PDF points
+    // from top-left) derived from the Good2Go reference claim known to print
+    // correctly on real CMS-1500 paper. Tweak per printer via ?calibrate=true.
     private static List<HcfaField> BuildFieldList(HcfaData data)
     {
         var f = new List<HcfaField>();
@@ -397,9 +375,8 @@ public sealed class HcfaPreviewService
         // Box 4 — Insured's name
         f.Add(new("4", 383, 132, h.InsuredName ?? h.PatientDisplayName));
 
-        // Box 5 — Patient address + phone. Phone is split into area code (3
-        // digits at x=126.5) and 7-digit number (at x=150.5), no separators,
-        // matching ChiroTouch's format.
+        // Box 5 — Patient address + phone. Phone split into area code (x=126.5)
+        // and 7-digit number (x=150.5), no separators, matching ChiroTouch.
         if (!string.IsNullOrWhiteSpace(h.PatientAddress)) f.Add(new("5-street", 27.5f, 157, h.PatientAddress!));
         if (!string.IsNullOrWhiteSpace(h.PatientCity))    f.Add(new("5-city",   27.5f, 180, h.PatientCity!));
         if (!string.IsNullOrWhiteSpace(h.PatientState))   f.Add(new("5-state", 205,    180, h.PatientState!));
@@ -441,9 +418,9 @@ public sealed class HcfaPreviewService
                 f.Add(new("10b-state", 335, 278, state!));
         }
 
-        // Box 11 — Insured's Policy/Group/FECA #. For Auto, often the claim #
-        // landed here; we don't have a canonical source yet so fall back to
-        // group number or insured ID.
+        // Box 11 — Insured's Policy/Group/FECA #. For Auto the claim # often
+        // lands here, but we have no canonical source yet — fall back to group
+        // number or insured ID.
         var box11 = h.GroupNo ?? h.InsuredIdNo;
         if (!string.IsNullOrWhiteSpace(box11))
             f.Add(new("11", 383, 228, box11!));
@@ -503,10 +480,9 @@ public sealed class HcfaPreviewService
         if (!string.IsNullOrWhiteSpace(h.PriorAuthNo))
             f.Add(new("23", 380, 460, h.PriorAuthNo!));
 
-        // Box 24 — Service lines (up to 6 rows starting at y=543, 24pt spacing
-        // per CT). Each form row actually has a supplemental-info sub-row
-        // above it (y=531.6 for row 1, etc.) for NDC/anesthesia data — we
-        // don't render those today; chiro claims don't use them.
+        // Box 24 — Service lines (up to 6 rows from y=543, 24pt spacing per CT).
+        // Each row has a supplemental sub-row above it for NDC/anesthesia data
+        // that we skip — chiro claims don't use them.
         var rowY = 543f;
         const float rowSpacing = 24f;
         for (int li = 0; li < Math.Min(6, data.Lines.Count); li++)
@@ -521,42 +497,34 @@ public sealed class HcfaPreviewService
             f.Add(new($"24A-to-YYYY-{li}",  124.2f,  rowY, dos.ToString("yyyy")));
             f.Add(new($"24B-POS-{li}",      151.2f,  rowY, "11"));
             f.Add(new($"24D-CPT-{li}",      197.3f,  rowY, line.Cpt ?? string.Empty));
-            // Modifier rule: 97150 (Exercise Group) always carries GP per
-            // historical claim patterns (6,794 confirmations). Extend the
-            // rule table when other CPT/modifier rules are confirmed.
+            // Billing rule: 97150 (Exercise Group) always carries GP per
+            // historical claim patterns (6,794 confirmations).
             if (string.Equals(line.Cpt, "97150", StringComparison.OrdinalIgnoreCase))
                 f.Add(new($"24D-Mod-{li}",  254.8f,  rowY, "GP"));
-            // DX pointer default: 1234 (renders as "ABCD" on the form),
-            // matching the standard pattern in ClaimLines. Per-CPT override
-            // logic can refine this when CT's exact rules are confirmed.
+            // DX pointer default 1234 (renders "ABCD"), matching ClaimLines'
+            // standard pattern. Per-CPT override can refine once CT's rules confirmed.
             f.Add(new($"24E-DX-{li}",       338f,    rowY, "ABCD"));
-            // Charge X position matches CT (411.2). Keep dollars-with-decimal
-            // ("45.00") which is the readable format both formats accept.
             f.Add(new($"24F-chg-{li}",      411.2f,  rowY, line.Charge.ToString("0.00")));
             f.Add(new($"24G-units-{li}",    446f,    rowY, "1"));
             f.Add(new($"24H-EPSDT-{li}",    466.2f,  rowY, "N"));
-            // Box 24J — use the chained-lookup RenderingNpi (per-policy override
-            // → per-(carrier,doctor) override → Doctors.NPI fallback) so per-
-            // carrier billing NPIs land correctly when configured.
+            // Box 24J — chained-lookup RenderingNpi (see header SQL) so per-carrier
+            // billing NPIs land correctly when configured.
             var rendNpi = h.RenderingNpi ?? h.DoctorNpi;
             if (!string.IsNullOrWhiteSpace(rendNpi))
                 f.Add(new($"24J-NPI-{li}",  504.5f,  rowY, rendNpi!));
 
-            // Shaded supplemental sub-row (12pt above the main row) carries
-            // the rendering provider's qualifier + taxonomy code:
-            //   "ZZ" = qualifier indicating a Health Care Provider Taxonomy
-            //   "111N00000X" = NUCC taxonomy code for Chiropractor (universal
-            //                  for chiro practices — Lugiano is 100% chiro)
-            // CT shows this strip at y=531.6 for line 1 (=543-11.4). Per-
-            // doctor taxonomy would override this when not chiro.
+            // Shaded sub-row (12pt above main row): rendering provider qualifier
+            // "ZZ" (Health Care Provider Taxonomy) + "111N00000X" (NUCC Chiropractor
+            // code — hardcoded since Lugiano is 100% chiro; per-doctor taxonomy
+            // would override otherwise).
             f.Add(new($"24I-qual-{li}",     486.5f, rowY - 12, "ZZ"));
             f.Add(new($"24J-taxonomy-{li}", 504.5f, rowY - 12, "111N00000X"));
             rowY += rowSpacing;
         }
 
-        // Box 25 — Federal Tax ID + EIN/SSN checkbox. EIN comes from
-        // ClaimBillingProviders.Identifier2 (Identifier2Code='EI'). When
-        // present, also mark the EIN checkbox X. Practice-level config.
+        // Box 25 — Federal Tax ID + EIN/SSN checkbox. EIN from
+        // ClaimBillingProviders.Identifier2 (Identifier2Code='EI'); mark the EIN
+        // checkbox X when present.
         if (!string.IsNullOrWhiteSpace(h.BillEntityEin))
         {
             f.Add(new("25-EIN", 24f, 683, h.BillEntityEin!));
@@ -564,20 +532,16 @@ public sealed class HcfaPreviewService
         }
 
         // Box 26 — Patient account #. Uses Patients.AccountNo (CT's billing
-        // account number, e.g. "306235"), NOT Patients.ID (our internal
-        // PatientId). CT writes the account number; the patient ID is for
-        // internal lookup only.
+        // account #, e.g. "306235"), NOT Patients.ID (internal PatientId).
         var acct = h.AccountNo?.ToString() ?? h.PatientId.ToString();
         f.Add(new("26", 180, 683, acct));
 
-        // Box 27 — Accept assignment. CT puts the X at (290.28, 683) in the
-        // same row as Box 25/26 — NOT at y=707 (which collides with Box 32
-        // facility line 1). Producing the "BA" overlap I was seeing.
+        // Box 27 — Accept assignment. X at (290.28, 683), same row as Box 25/26 —
+        // NOT y=707, which collides with Box 32 facility line 1 (the "BA" overlap).
         f.Add(new("27", h.AcceptAssignment == 1 ? 290.28f : 320f, 683, "X"));
 
-        // Box 28/29/30 — CT writes these as CENTS with no decimal
-        // ("30000" = $300.00, "000" = $0.00). The dollar-sign and decimal
-        // come from the pre-printed form. Position y≈685.5, X=416.5/500.5.
+        // Box 28/29/30 — CT writes these as CENTS with no decimal ("30000" =
+        // $300.00); the $ and decimal come from the pre-printed form.
         var totalCents = ((int)Math.Round(data.TotalCharge * 100)).ToString();
         f.Add(new("28", 416.5f, 685.5f, totalCents));
         f.Add(new("29", 500.5f, 685.5f, "000"));
@@ -607,11 +571,10 @@ public sealed class HcfaPreviewService
         if (!string.IsNullOrWhiteSpace(h.FacilityNpi))
             f.Add(new("32a-NPI", 189f, 746.6f, h.FacilityNpi!));
 
-        // Box 33 — Billing provider (the remit-to address — usually the
-        // practice's PO box, distinct from the service facility). Sourced
-        // from ClaimBillingProviders.LastName + PayToAddress* (practice-
-        // wide config). Falls back to facility info if no billing config
-        // is present (e.g. a clinic that hasn't generated claims yet).
+        // Box 33 — Billing provider / remit-to address (usually the practice's
+        // PO box, distinct from the service facility). From ClaimBillingProviders
+        // .LastName + PayToAddress*; falls back to facility info if no billing
+        // config exists (e.g. a clinic that hasn't generated claims yet).
         var billName = !string.IsNullOrWhiteSpace(h.BillEntityName) ? h.BillEntityName! : null;
         var payZip = string.IsNullOrWhiteSpace(h.PayToZip)
             ? null
@@ -641,10 +604,8 @@ public sealed class HcfaPreviewService
         return f;
     }
 
-    // Locates the blank-form PNG packaged under Assets/. Returns null +
-    // logs a warning if the file is missing so the renderer falls back to
-    // a data-only page instead of throwing — fax with no overlay is still
-    // better than a hard 500 mid-demo.
+    // Locates the blank-form PNG under Assets/. Returns null + warns if missing
+    // so the renderer falls back to a data-only page instead of a hard 500.
     private string? ResolveOverlayPath()
     {
         var path = Path.Combine(AppContext.BaseDirectory, "Assets", "CMS-1500-overlay.png");
@@ -660,9 +621,8 @@ public sealed class HcfaPreviewService
     // HCFA box ref (used by the ?calibrate=true overlay for alignment checks).
     private sealed record HcfaField(string BoxId, float X, float Y, string Value, float FontSize = 9);
 
-    // Phone formatter — strips all non-digits and splits into area code +
-    // 7-digit number. CT renders phones as two separate values at two X
-    // positions, no parens or hyphens, so we return them split.
+    // Splits phone into area code + 7-digit number (no separators) because CT
+    // renders phones as two separate values at two X positions.
     private static (string? Area, string? Number) SplitPhone(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return (null, null);

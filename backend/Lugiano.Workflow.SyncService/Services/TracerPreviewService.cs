@@ -28,7 +28,7 @@ public sealed class TracerPreviewService
     }
 
     // Lists outstanding-AR batches for a patient (one row per bill date+payer),
-    // newest first. Used by the portal Tracer page to show expandable rows.
+    // newest first. Drives the portal Tracer page's expandable rows.
     public async Task<IReadOnlyList<TracerBatch>> ListBatchesAsync(int patientId, CancellationToken ct = default)
     {
         await using var conn = _sourceDb.Create();
@@ -89,11 +89,9 @@ public sealed class TracerPreviewService
             new { patientId, billedDate = billedDate.Date });
         if (header is null) return null;
 
-        // Diagnoses scoped to the appointments in THIS billed batch only —
-        // matches CT's tracer behavior (which shows only the DXs attached
-        // to the visits being traced, not the patient's lifetime DX history).
-        // The inner subquery is the exact same shape as
-        // GetAppointmentIdsForBatchAsync so the two stay in lockstep.
+        // Diagnoses scoped to THIS batch's appointments only, matching CT's tracer
+        // (only DXs on the traced visits, not lifetime DX history). Inner subquery
+        // mirrors GetAppointmentIdsForBatchAsync so the two stay in lockstep.
         var diagnoses = (await conn.QueryAsync<TracerDx>(
             """
             SELECT DISTINCT d.Code, d.Description
@@ -112,9 +110,8 @@ public sealed class TracerPreviewService
             """,
             new { patientId, billedDate = billedDate.Date })).ToList();
 
-        // Charge lines — DOS, injury date, CPT, description, amount. Injury
-        // date comes from Patients.CurInjuryDate (one per patient for the
-        // active case).
+        // Charge lines. Injury date is Patients.CurInjuryDate (one per patient,
+        // the active case).
         var lines = (await conn.QueryAsync<TracerLine>(
             """
             SELECT t.TranDate    AS DateOfService,
@@ -136,10 +133,9 @@ public sealed class TracerPreviewService
         return new TracerData(header, diagnoses, lines, billedDate.Date, total);
     }
 
-    // Returns the distinct PSChiro Appointment IDs that contributed billed
-    // (but-unpaid) charges to a single tracer batch. Used by the tracer
-    // controller when the "Include HCFA" checkbox is on, so we can render
-    // one HCFA per appointment after the batch's tracer page.
+    // Distinct PSChiro Appointment IDs that contributed billed-but-unpaid charges
+    // to one batch. Used when the "Include HCFA" checkbox is on, to render one
+    // HCFA per appointment after the batch's tracer page.
     public async Task<IReadOnlyList<int>> GetAppointmentIdsForBatchAsync(
         int patientId, DateTime billedDate, CancellationToken ct = default)
     {
@@ -169,9 +165,9 @@ public sealed class TracerPreviewService
         }).GeneratePdf();
     }
 
-    // Adds a single tracer batch page to an existing document container.
-    // Caller owns Document.Create + License setup. Used by the tracer endpoint
-    // when interleaving tracer pages with bundled HCFA forms.
+    // Adds a single tracer batch page to an existing document. Caller owns
+    // Document.Create + License setup. Used when interleaving tracer pages with
+    // bundled HCFA forms.
     public void AddBatchPageToDocument(IDocumentContainer doc, TracerData batch)
     {
         doc.Page(page =>

@@ -7,13 +7,11 @@ namespace Lugiano.Workflow.SyncService.Util;
 // weight. ColorHex is "#RRGGBB" (auto/default resolves to black).
 public sealed record RtfRun(string Text, string ColorHex, bool Bold);
 
-// Best-effort RTF -> styled runs, grouped into paragraphs, so chart-note PDFs can
-// reproduce ChiroTouch's blue/red coloring and bold section headers. Returns null
-// when the input isn't RTF or can't be parsed; callers fall back to plain text.
-//
-// This is intentionally a separate pass from RtfConverter.ToPlainText: that one
-// stays the fast, lossy path used by the scrubber and sync, while this one carries
-// the formatting only the print/fax PDFs need.
+// Best-effort RTF -> styled runs grouped into paragraphs, so chart-note PDFs
+// reproduce ChiroTouch's blue/red coloring and bold section headers. Returns
+// null when input isn't RTF or can't be parsed; callers fall back to plain text.
+// Deliberately separate from RtfConverter.ToPlainText: that stays the fast,
+// lossy path for scrubber/sync, this carries the formatting only PDFs need.
 public static class RtfRichConverter
 {
     public const string DefaultColor = "#000000";

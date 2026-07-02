@@ -15,10 +15,9 @@ public sealed class ScrubReviewController : ControllerBase
 
     public ScrubReviewController(IDbContextFactory<WorkflowDbContext> factory) => _factory = factory;
 
-    // GET /scrub-review — patients whose latest scrub verdict is 'fail'.
-    // The triage queue: staff opens each, drills into /cases/{id}/show, and
-    // decides whether to send back to the doctor or fix on the billing side.
-    // ra-data-simple-rest: ?range=[start,end] + Content-Range.
+    // GET /scrub-review — patients whose latest scrub verdict is 'fail'. Triage
+    // queue: staff drills into /cases/{id}/show and decides to send back to the
+    // doctor or fix on the billing side. ra-data-simple-rest: ?range=[start,end].
     [HttpGet]
     public async Task<IActionResult> GetReviewQueue([FromQuery] string? range)
     {
@@ -27,13 +26,11 @@ public sealed class ScrubReviewController : ControllerBase
 
         await using var db = await _factory.CreateDbContextAsync();
 
-        // Per-note scrubs (DoctorNoteId IS NOT NULL). For each note, take its
-        // latest scrub. Roll up to the case: if ANY note's latest is Fail,
-        // the case is in the review queue. ScrubResult is append-only and
-        // small in practice — pull a thin projection, reduce in memory.
-        // Scrub Review = chart-sourced notes that failed (doctor hasn't been
-        // given a chance to correct yet). Portal-authored failures are routed
-        // to Human Review instead — see HumanReviewController.
+        // Per-note scrubs: take each note's latest; if ANY note's latest is Fail,
+        // the case is in the queue. ScrubResult is append-only and small — thin
+        // projection, reduce in memory. Scrub Review = failed CHART notes (doctor
+        // not yet given a chance to correct); portal-authored failures route to
+        // Human Review instead — see HumanReviewController.
         var allScrubs = await db.ScrubResults.AsNoTracking()
             .Where(s => s.DoctorNoteId != null
                         && db.DoctorNotes.Any(n => n.Id == s.DoctorNoteId && !n.IsPortalAuthored))
@@ -53,8 +50,7 @@ public sealed class ScrubReviewController : ControllerBase
             .Select(g => g.OrderByDescending(s => s.RanAt).First())
             .ToList();
 
-        // Case rollup — keep one row per case with the most-recent failing
-        // note as its representative for the queue.
+        // Case rollup — one row per case, most-recent failing note as its rep.
         var failedLatest = latestPerNote
             .Where(s => s.Verdict == ScrubVerdicts.Fail)
             .GroupBy(s => s.WorkflowCaseId)
@@ -72,10 +68,9 @@ public sealed class ScrubReviewController : ControllerBase
                 .Where(c => caseIds.Contains(c.Id))
                 .ToDictionaryAsync(c => c.Id);
 
-        // Pre-fetch the failing notes' plain text + authoring doctor so the
-        // Doctor View modal can show the original to edit in-place, and the
-        // queue list can surface "this would be sent to Dr. X" (admins see
-        // every row, but real doctor portal scoping is task #40).
+        // Pre-fetch failing notes' plain text + authoring doctor so the Doctor
+        // View modal can edit in-place and the list can show "would be sent to
+        // Dr. X" (admins see every row; real doctor scoping is task #40).
         var noteIds = page.Select(s => s.NoteId).Distinct().ToList();
         var noteInfoById = noteIds.Count == 0
             ? new Dictionary<int, (string? PlainText, int? DoctorId)>()
@@ -85,8 +80,8 @@ public sealed class ScrubReviewController : ControllerBase
                 .ToListAsync())
                 .ToDictionary(n => n.Id, n => (n.PlainText, n.DoctorId));
 
-        // Map ChiroTouch doctor ids -> names via our Doctor table. Doctor.ChiroTouchDoctorId
-        // is the bridge column; FullName is "First Last, Credential".
+        // Map ChiroTouch doctor ids -> names. Doctor.ChiroTouchDoctorId is the
+        // bridge column; FullName is "First Last, Credential".
         var ctDoctorIds = noteInfoById.Values
             .Select(v => v.DoctorId)
             .Where(d => d.HasValue)
@@ -115,17 +110,15 @@ public sealed class ScrubReviewController : ControllerBase
                 latestScrubAt = s.RanAt,
                 latestScrubVerdict = s.Verdict,
                 summary = s.Summary,
-                // The specific failing note. The Doctor View modal passes this
-                // as originalDoctorNoteId on submit so the PSChiro writeback
-                // anchors to the correct visit's date + doctor.
+                // The failing note. Modal passes this as originalDoctorNoteId so
+                // the writeback anchors to the correct visit's date + doctor.
                 doctorNoteId = s.NoteId,
-                // Original note text pre-fills the modal's textarea so the
-                // doctor edits in place rather than re-authoring from scratch.
-                // Plain text — RTF formatting was already stripped on sync;
-                // the writeback re-wraps in minimal RTF for TX_RTF32.
+                // Pre-fills the modal textarea for in-place editing. Plain text —
+                // RTF was stripped on sync; the writeback re-wraps in minimal RTF
+                // for TX_RTF32.
                 originalText = info.PlainText,
-                // Authoring doctor — surfaced so admins can see whose queue
-                // this would be in once portal logins are scoped (task #40).
+                // Authoring doctor — lets admins see whose queue this would be in
+                // once portal logins are scoped (task #40).
                 doctor,
             };
         }).ToList();

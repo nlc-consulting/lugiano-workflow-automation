@@ -20,9 +20,8 @@ public sealed class CorrectionsController : ControllerBase
     }
 
     // GET /cases/{patientId}/notes/{chartNoteId}/doctors
-    // {chartNoteId} is the ChiroTouch ChartNote ID (what the portal already
-    // knows from the patient detail). We resolve it to our local DoctorNote
-    // internally — keeps the URL stable across our import/sync internals.
+    // {chartNoteId} is the ChiroTouch ChartNote ID; resolved to our local
+    // DoctorNote internally so the URL stays stable across import/sync.
     // V1 returns primary doctor only (SecondaryDoctorID is task #41); the
     // array shape is forward-compatible for when secondary lands.
     [HttpGet("cases/{patientId:int}/notes/{chartNoteId:int}/doctors")]

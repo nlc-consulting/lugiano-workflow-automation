@@ -3,10 +3,10 @@ using Microsoft.AspNetCore.Mvc;
 
 namespace Lugiano.Workflow.SyncService.Controllers;
 
-// Preview-only EOB posting. Reads an uploaded EOB Line Items workbook,
-// matches each line against PSChiro Transactions, returns proposed updates.
-// NO write-back. The Apply path is task-tracked separately and needs
-// broader lugiano_rw permissions (UPDATE on Transactions columns).
+// Preview-only EOB posting. Reads an uploaded EOB Line Items workbook, matches
+// each line against PSChiro Transactions, returns proposed updates. NO write-
+// back. The Apply path is task-tracked separately and needs broader lugiano_rw
+// permissions (UPDATE on Transactions columns).
 [ApiController]
 [Route("eob")]
 public sealed class EobController : ControllerBase
@@ -43,11 +43,9 @@ public sealed class EobController : ControllerBase
         }
     }
 
-    // GET /eob/lookup-patient?accountNo=N — manual override path. Operator
-    // types the ChiroTouch AccountNo they recognize for a patient; we return
-    // the matching patient (with name + DOB) for confirmation, or 404 if no
-    // patient has that AccountNo. Frontend shows the result in a confirm
-    // dialog before invoking resolve-line on the chosen patient.
+    // GET /eob/lookup-patient?accountNo=N — manual override path. Operator types
+    // a known ChiroTouch AccountNo; returns the matching patient (name + DOB) for
+    // confirmation, or 404. Frontend confirms before invoking resolve-line.
     [HttpGet("lookup-patient")]
     public async Task<IActionResult> LookupPatient(
         [FromQuery] int accountNo,
@@ -62,10 +60,8 @@ public sealed class EobController : ControllerBase
     }
 
     // POST /eob/resolve-line — re-runs the per-line match against a chosen
-    // patient. Used by the portal's fuzzy-suggestion chip on unmatched lines:
-    // operator clicks a suggested patient, frontend POSTs the original line
-    // + patientId, we return the new bucket (matched / ambiguous / still
-    // unmatched). No PSChiro writes — pure read.
+    // patient (portal's fuzzy-suggestion chip on unmatched lines). Returns the
+    // new bucket (matched / ambiguous / still unmatched). No writes — pure read.
     [HttpPost("resolve-line")]
     public async Task<IActionResult> ResolveLine(
         [FromBody] ResolveLineRequest req,
@@ -79,10 +75,10 @@ public sealed class EobController : ControllerBase
 
     public sealed record ResolveLineRequest(EobLine Line, int PatientId);
 
-    // POST /eob/apply — same xlsx upload as /preview, but actually writes to
-    // PSChiro. Re-runs the match server-side (no client-tampered list of
-    // proposed updates), applies all unambiguous matches in one transaction,
-    // and returns a per-line report (applied/skipped/ambiguous/unmatched).
+    // POST /eob/apply — same xlsx as /preview, but writes to PSChiro. Re-runs
+    // the match server-side (never trusts a client-supplied update list), applies
+    // unambiguous matches in one transaction, returns a per-line report
+    // (applied/skipped/ambiguous/unmatched).
     [HttpPost("apply")]
     [RequestSizeLimit(20 * 1024 * 1024)]
     public async Task<IActionResult> Apply(IFormFile? file, CancellationToken ct)

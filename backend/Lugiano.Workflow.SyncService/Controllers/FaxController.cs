@@ -4,8 +4,8 @@ using Microsoft.AspNetCore.Mvc;
 
 namespace Lugiano.Workflow.SyncService.Controllers;
 
-// Manual fax-send endpoints. Both render the same PDF the preview endpoints
-// already produce, then hand it to Documo. Used by the portal's "Fax now"
+// Manual fax-send endpoints. Both render the same PDF as the preview
+// endpoints, then hand it to Documo. Driven by the portal's "Fax now"
 // buttons; auto-fax-on-state-transition is a future epic — until then a
 // human always pulls the trigger.
 [ApiController]

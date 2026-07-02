@@ -4,11 +4,9 @@ using Microsoft.AspNetCore.Mvc;
 
 namespace Lugiano.Workflow.SyncService.Controllers;
 
-// Production billing actions. Today: a single endpoint that marks every
-// unbilled service charge on a visit as billed (the manual stand-in for the
-// post-fax-delivery hook that will eventually auto-fire). This is NOT a
-// test affordance — same code path will run automatically once the fax
-// confirmation webhook lands.
+// Production billing actions. Marks every unbilled service charge on a visit
+// as billed — manual stand-in for the post-fax-delivery hook. NOT a test
+// affordance: same code path fires automatically once the fax webhook lands.
 [ApiController]
 [Route("billing")]
 public sealed class BillingController : ControllerBase

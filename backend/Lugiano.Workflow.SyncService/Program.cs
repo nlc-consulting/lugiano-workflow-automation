@@ -18,10 +18,9 @@ var builder = WebApplication.CreateBuilder(args);
 var hostingUrl = builder.Configuration["Hosting:Url"] ?? "http://localhost:5100";
 builder.WebHost.UseUrls(hostingUrl);
 
-// Bump Kestrel body-size cap to 300MB so EOB scan uploads (65MB non-lockbox,
-// 250MB LM mail on heavy days) can land. Default is 30MB — a scan upload
-// past that just hangs the client. Controller-level [RequestSizeLimit] alone
-// doesn't override the server-level cap.
+// Kestrel body cap 300MB for EOB scan uploads (65MB non-lockbox, 250MB LM
+// mail on heavy days). Default 30MB hangs the client; controller-level
+// [RequestSizeLimit] alone doesn't override the server-level cap.
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 300L * 1024 * 1024);
 // FormOptions governs multipart parsing — also has a 128MB default cap.
 builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(o =>
@@ -136,12 +135,10 @@ builder.Services.AddSingleton<IEmailSender>(sp =>
 });
 
 // Scrubbing: named HttpClient + Claude integration + orchestrator.
-// Named client (vs typed) avoids captive-HttpClient issues when consumed by
-// singletons — ClaudeScrubber resolves a fresh client per scrub via the factory.
-// The "anthropic" client is shared with EobScan — bumped to 5min because PDF
-// extraction over a 15-page slice typically takes 40-100s, occasionally more
-// on retries. Chart-note scrubs still complete in 5-15s so the longer ceiling
-// doesn't affect their happy path.
+// Named (not typed) client avoids captive-HttpClient issues in singletons —
+// ClaudeScrubber resolves a fresh client per scrub. Shared with EobScan and
+// bumped to 5min: PDF extraction over a 15-page slice takes 40-100s (more on
+// retries); chart-note scrubs finish in 5-15s so the ceiling doesn't hurt them.
 builder.Services.AddHttpClient("anthropic", c =>
 {
     c.Timeout = TimeSpan.FromMinutes(5);
@@ -149,10 +146,9 @@ builder.Services.AddHttpClient("anthropic", c =>
 builder.Services.AddSingleton<IScrubber, ClaudeScrubber>();
 builder.Services.AddSingleton<ScrubOrchestrator>();
 
-// EOB scanner — replaces the DS mail-scan vendor. Claude Vision over the
-// scanned PDF, fans out 15-page chunks (2-page overlap) in parallel, dedupes,
-// persists straight into the DB so staff work the data inside the portal
-// instead of round-tripping through an xlsx import.
+// EOB scanner — replaces the DS mail-scan vendor. Claude Vision over the PDF,
+// fans out 15-page chunks (2-page overlap) in parallel, dedupes, persists to
+// the DB so staff work the data in-portal instead of via xlsx import.
 builder.Services.AddSingleton<IClaudeEobExtractor, ClaudeEobExtractor>();
 builder.Services.AddSingleton<EobScanService>();
 
@@ -160,6 +156,10 @@ builder.Services.AddSingleton<EobScanService>();
 // to send HCFA + tracer PDFs straight to carrier fax inboxes.
 builder.Services.Configure<Lugiano.Workflow.SyncService.Services.Fax.DocumoOptions>(
     builder.Configuration.GetSection("Documo"));
+// Practice-side info for the HIPAA fax cover sheet (FROM block).
+// See FaxCoverOptions for defaults; override in appsettings if needed.
+builder.Services.Configure<Lugiano.Workflow.SyncService.Services.Fax.FaxCoverOptions>(
+    builder.Configuration.GetSection(Lugiano.Workflow.SyncService.Services.Fax.FaxCoverOptions.SectionName));
 builder.Services.AddHttpClient<Lugiano.Workflow.SyncService.Services.Fax.DocumoFaxClient>();
 builder.Services.AddScoped<Lugiano.Workflow.SyncService.Services.Fax.FaxService>();
 
@@ -171,10 +171,9 @@ app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
 
-// PROTOTYPE: migrate-on-startup is convenient for fast iteration. Production must
-// set Database:MigrateOnStartup=false and run migrations as a deliberate deploy step
-// (`dotnet ef database update` from CI, or a separate migrator job) — concurrent
-// instances racing this on boot will corrupt the migration history.
+// PROTOTYPE: migrate-on-startup for fast iteration. Production MUST set
+// Database:MigrateOnStartup=false and migrate as a deliberate deploy step —
+// concurrent instances racing this on boot corrupt the migration history.
 var migrateOnStartup = builder.Configuration.GetValue<bool?>("Database:MigrateOnStartup") ?? true;
 if (migrateOnStartup)
 {

@@ -5,13 +5,10 @@ using Microsoft.Extensions.Logging;
 
 namespace Lugiano.Workflow.SyncService.Services.EobScanning;
 
-// Anthropic Messages API client for EOB extraction. Mirrors the scrubber's
-// pattern exactly: HTTP via IHttpClientFactory, prompt cache on the system
-// block (the system prompt + tool schema are stable per-scan), forced
-// tool_use so we don't have to parse prose JSON.
-//
-// Prompt + tool schema were validated via backend/scratch/EobScanSpike
-// (4/22 ground-truth diff). See ClaudeEobPrompt for the locked text.
+// Anthropic Messages API client for EOB extraction. Mirrors the scrubber:
+// HTTP via IHttpClientFactory, prompt cache on the (stable) system block,
+// forced tool_use to avoid parsing prose JSON. Prompt + tool schema validated
+// via backend/scratch/EobScanSpike (4/22 ground-truth diff); text in ClaudeEobPrompt.
 public interface IClaudeEobExtractor
 {
     Task<EobExtractionResult> ExtractAsync(PdfChunk chunk, CancellationToken ct = default);
@@ -70,8 +67,8 @@ public sealed class ClaudeEobExtractor : IClaudeEobExtractor
     {
         var apiKey = ResolveApiKey()
             ?? throw new InvalidOperationException("Anthropic API key not configured (Anthropic:ApiKey or ANTHROPIC_API_KEY).");
-        // Sonnet 4.5 by default — matches the scrubber. Bump via config once
-        // we've validated 4.6 quality on EOB scans specifically.
+        // Sonnet 4.5 by default (matches the scrubber). Bump via config once
+        // 4.6 quality is validated on EOB scans specifically.
         var model = _config["Anthropic:Model"] ?? "claude-sonnet-4-5";
 
         var base64 = Convert.ToBase64String(chunk.Bytes);
@@ -85,10 +82,9 @@ public sealed class ClaudeEobExtractor : IClaudeEobExtractor
         };
         req.Headers.Add("x-api-key", apiKey);
         req.Headers.Add("anthropic-version", "2023-06-01");
-        // PDF document blocks are now GA — beta header dropped 6/30/2026
-        // after all-chunks-400 failures on scan #7 while the header was still
-        // being sent. If PDFs stop working again we may need to re-add it,
-        // but the fresh sonnet-4-5 API rejects "pdfs-2024-09-25" as unknown.
+        // PDF document blocks are GA — beta header dropped 6/30/2026 after
+        // all-chunks-400 failures on scan #7. The sonnet-4-5 API now rejects
+        // "pdfs-2024-09-25" as unknown; re-add only if PDFs break again.
 
         using var resp = await http.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
@@ -128,9 +124,8 @@ public sealed class ClaudeEobExtractor : IClaudeEobExtractor
     private static object BuildPayload(string model, string pdfBase64, int firstPageOffset) => new
     {
         model,
-        // 32K leaves comfortable headroom for a 15-page chunk's typical
-        // output (~3-5K tokens). Sonnet 4.5 supports up to 64K output if
-        // we need to go bigger later.
+        // 32K leaves headroom for a chunk's typical output. Sonnet 4.5 supports
+        // up to 64K output if we need to go bigger later.
         max_tokens = 32768,
         system = new object[]
         {

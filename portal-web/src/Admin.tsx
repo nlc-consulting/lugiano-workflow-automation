@@ -1,4 +1,4 @@
-import { Admin, Resource, combineDataProviders, defaultTheme } from 'react-admin'
+import { Admin, Layout, Resource, combineDataProviders, defaultTheme, type LayoutProps } from 'react-admin'
 import { createTheme } from '@mui/material/styles'
 import People from '@mui/icons-material/People'
 import Dashboard from '@mui/icons-material/Dashboard'
@@ -21,9 +21,19 @@ import DoctorReviewList from './doctor-view/DoctorReviewList'
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 import EobPreview from './eob/EobPreview'
 import EobScan from './eob/EobScan'
+import ScrollTopFab from './ScrollTopFab'
 import Login from './Login'
 
 const LUGIANO_RED = '#E11D2A'
+
+// Wrap the default layout so the floating "jump to top" button rides along on
+// every page (fixed-position, outside the scroll flow).
+const AppLayout = (props: LayoutProps) => (
+  <>
+    <Layout {...props} />
+    <ScrollTopFab />
+  </>
+)
 
 const theme = createTheme({
   ...defaultTheme,
@@ -63,6 +73,7 @@ export const AppAdmin = () => (
     dataProvider={dataProvider}
     authProvider={authProvider}
     theme={theme}
+    layout={AppLayout}
     loginPage={Login}
     title="Lugiano Portal"
   >

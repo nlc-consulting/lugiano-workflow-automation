@@ -30,8 +30,8 @@ public sealed class EobScan
     public DateTime? ProcessingStartedAt { get; set; }
     public DateTime? CompletedAt { get; set; }
 
-    // Chunking config used — captured for debugging when accuracy drifts and
-    // we want to know what slice size produced a given scan's output.
+    // Chunking config used — captured so we know what slice size produced a
+    // given scan's output when accuracy drifts.
     public int ChunkSize { get; set; }
     public int ChunkOverlap { get; set; }
 

@@ -4,18 +4,22 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Lugiano.Workflow.SyncService.Services;
 
+// Minimal projection of a chart-sourced DoctorNote used for staleness checks
+// (our stored SoapPtr vs ChiroTouch's current SOAPPtr).
+public sealed record DoctorNoteRef(int Id, int PatientId, int ChartNoteId, int? SoapPtr, DateTime? SignedAt);
+
 public sealed class WorkflowCaseService
 {
     private readonly IDbContextFactory<WorkflowDbContext> _dbFactory;
 
     public WorkflowCaseService(IDbContextFactory<WorkflowDbContext> dbFactory) => _dbFactory = dbFactory;
 
-    // Creates or RECONCILES a patient's case from the full ChiroTouch truth.
-    // Every trigger passes the reconciled status (insurance + notes + real dates),
-    // so a note trigger also captures insurance present since intake and vice versa.
-    // Stamps reflect current reality (set, not first-seen); state is always derived.
-    // PIP is portal-driven and preserved across reconciliation.
-    // Returns the WorkflowCase.Id. One case per patient (unique index on PatientId).
+    // Creates or RECONCILES a patient's case from full ChiroTouch truth: every
+    // trigger passes reconciled status (insurance + notes + real dates), so a
+    // note trigger also captures insurance seen since intake and vice versa.
+    // Stamps reflect current reality (set, not first-seen); state is derived.
+    // PIP is portal-driven and preserved across reconciliation. Returns the
+    // WorkflowCase.Id. One case per patient (unique index on PatientId).
     public async Task<int> CreateOrUpdateCaseAsync(
         int patientId, string? firstName, string? lastName,
         bool hasInsurance, DateTime? insuranceAddedAt,
@@ -154,6 +158,29 @@ public sealed class WorkflowCaseService
         await db.SaveChangesAsync();
     }
 
+    // Resolve the WorkflowCase.Id for a patient, or null if no case exists.
+    // Used by the historical-notes backfill to attach imported notes to the
+    // right case row.
+    public async Task<int?> GetCaseIdByPatientIdAsync(int patientId, CancellationToken ct = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        return await db.WorkflowCases
+            .Where(c => c.PatientId == patientId)
+            .Select(c => (int?)c.Id)
+            .FirstOrDefaultAsync(ct);
+    }
+
+    // Every distinct patient ID currently in WorkflowCase. Used by the
+    // batch historical-notes backfill to walk the whole practice.
+    public async Task<IReadOnlyList<int>> GetAllPatientIdsAsync(CancellationToken ct = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        return await db.WorkflowCases
+            .OrderBy(c => c.Id)
+            .Select(c => c.PatientId)
+            .ToListAsync(ct);
+    }
+
     // True when we already have at least one DoctorNote for this patient.
     // Used by the sync service to decide whether to trigger a full history
     // backfill on first encounter.
@@ -176,6 +203,79 @@ public sealed class WorkflowCaseService
         note.CreatedAt = DateTime.UtcNow;
         db.DoctorNotes.Add(note);
         await db.SaveChangesAsync();
+    }
+
+    // Refresh a chart-sourced DoctorNote's content in place after ChiroTouch
+    // changed it under us (the doctor edited/finalized the note — SOAPPtr got
+    // repointed, or a signature landed/moved). This is the write half of the
+    // "note edited" trigger we never had: our original insert froze RawRtf/
+    // PlainText at first capture and nothing ever refreshed them.
+    //
+    // No-op returning null when the row is missing or nothing actually changed
+    // (idempotent — safe to call on every sweep). Returns the DoctorNote.Id on a
+    // real update so the caller can re-fire the scrub against the fresh text.
+    public async Task<int?> UpdateDoctorNoteContentAsync(
+        int chartNoteId, int? soapPtr, string? rawRtf, string? plainText, DateTime? signedAt)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        var row = await db.DoctorNotes.FirstOrDefaultAsync(x => x.ChartNoteId == chartNoteId);
+        if (row is null) return null;
+
+        bool changed = row.SoapPtr != soapPtr
+            || row.RawRtf != rawRtf
+            || row.SignedAt != signedAt;
+        if (!changed) return null;
+
+        row.SoapPtr = soapPtr;
+        row.RawRtf = rawRtf;
+        row.PlainText = plainText;
+        row.SignedAt = signedAt;
+        row.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+        return row.Id;
+    }
+
+    // Metadata-only update: persist just the ChiroTouch signed time (and stamp
+    // UpdatedAt) when a note was (re-)signed but its content pointer is
+    // unchanged. Cheap path used by the reconcile sweep so a sign-only change
+    // (and the one-time SignedAt backfill) doesn't re-read RTF or re-scrub.
+    public async Task UpdateDoctorNoteSignedAtAsync(int chartNoteId, DateTime? signedAt)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        var row = await db.DoctorNotes.FirstOrDefaultAsync(x => x.ChartNoteId == chartNoteId);
+        if (row is null || row.SignedAt == signedAt) return;
+        row.SignedAt = signedAt;
+        row.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+    }
+
+    // Lightweight refs for every chart-sourced DoctorNote (optionally scoped to
+    // one patient), for staleness detection: compare each row's SoapPtr against
+    // ChiroTouch's current SOAPPtr to find notes that drifted since capture.
+    public async Task<IReadOnlyList<DoctorNoteRef>> GetChartSourcedNoteRefsAsync(
+        int? patientId = null, CancellationToken ct = default)
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        var q = db.DoctorNotes.AsNoTracking().Where(x => x.ChartNoteId != null);
+        if (patientId is int pid) q = q.Where(x => x.PatientId == pid);
+        return await q
+            .Select(x => new DoctorNoteRef(x.Id, x.PatientId, x.ChartNoteId!.Value, x.SoapPtr, x.SignedAt))
+            .ToListAsync(ct);
+    }
+
+    // Refs for a specific set of ChartNote IDs — the targeted lookup the
+    // signature-cursor trigger uses to reconcile only the notes that were just
+    // (re-)signed, instead of sweeping the whole table each 30s poll.
+    public async Task<IReadOnlyList<DoctorNoteRef>> GetChartSourcedNoteRefsByChartNoteIdsAsync(
+        IEnumerable<int> chartNoteIds, CancellationToken ct = default)
+    {
+        var ids = chartNoteIds.Distinct().ToList();
+        if (ids.Count == 0) return Array.Empty<DoctorNoteRef>();
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        return await db.DoctorNotes.AsNoTracking()
+            .Where(x => x.ChartNoteId != null && ids.Contains(x.ChartNoteId.Value))
+            .Select(x => new DoctorNoteRef(x.Id, x.PatientId, x.ChartNoteId!.Value, x.SoapPtr, x.SignedAt))
+            .ToListAsync(ct);
     }
 
     // Inserts a doctor-authored correction note made through the portal (no

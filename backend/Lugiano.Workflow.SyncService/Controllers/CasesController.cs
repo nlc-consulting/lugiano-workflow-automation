@@ -57,40 +57,31 @@ public sealed class CasesController : ControllerBase
 
         await using var db = await _factory.CreateDbContextAsync();
 
-        // Load ALL cases — several visible columns (LastNoteDate, insurance
-        // balance, latest scrub) are computed from joined data, so we can't
-        // sort + paginate at the SQL level without denormalizing those onto
-        // WorkflowCase. With ~700 cases the in-memory sort is sub-millisecond.
-        // When this becomes a problem, pre-compute the joined fields on the
-        // WorkflowCase row (or move pagination to a SQL view).
+        // Load ALL cases — visible columns (LastNoteDate, insurance balance,
+        // latest scrub) are computed from joins, so we can't sort/paginate in
+        // SQL. ~700 rows, in-memory sort is sub-millisecond.
         var cases = await db.WorkflowCases.AsNoTracking().ToListAsync();
 
         var caseIds = cases.Select(c => c.Id).ToList();
         var patientIds = cases.Select(c => c.PatientId).ToList();
 
-        // Per-note scrubs aggregated to a case-level chip. For each case:
-        // take each note's LATEST scrub, then roll up:
-        //   any fail        -> case = fail
-        //   else needs_review -> case = needs_review
-        //   else (all pass and every note scrubbed) -> case = pass
-        //   else (some notes unscrubbed and no known issues) -> null (partial)
-        // The full per-note breakdown lives on the case detail.
+        // Per-note scrubs aggregated to a case-level chip: take each note's
+        // latest scrub, then roll up (any fail -> fail; else needs_review ->
+        // needs_review; else all pass -> pass; else partial -> null). Full
+        // per-note breakdown lives on the case detail.
         var perNoteScrubs = await db.ScrubResults.AsNoTracking()
             .Where(s => s.DoctorNoteId != null && caseIds.Contains(s.WorkflowCaseId))
             .Select(s => new { s.WorkflowCaseId, NoteId = s.DoctorNoteId!.Value, s.Verdict, s.RanAt })
             .ToListAsync();
 
-        // Distinct notes with at least one scrub.
         var latestByNote = perNoteScrubs
             .GroupBy(s => new { s.WorkflowCaseId, s.NoteId })
             .Select(g => g.OrderByDescending(s => s.RanAt).First())
             .ToList();
 
-        // Latest note per case by clinical NoteDate (tiebreak on Id — newer Id
-        // wins on same-date). Drives LastNoteDate + the scrub rollup. EF Core 8
-        // doesn't translate `g.OrderBy(...).First()` projections inside GroupBy
-        // (EmptyProjectionMember), so we pull the rows and group in memory —
-        // bounded by page size × ~50 notes per case, cheap.
+        // Latest note per case by NoteDate (tiebreak on Id). Drives LastNoteDate
+        // + the scrub rollup. EF Core 8 can't translate g.OrderBy().First()
+        // inside GroupBy (EmptyProjectionMember), so we group in memory — cheap.
         var notesForCases = await db.DoctorNotes.AsNoTracking()
             .Where(n => caseIds.Contains(n.WorkflowCaseId))
             .Select(n => new { CaseId = n.WorkflowCaseId, NoteId = n.Id, n.NoteDate, n.ChartNoteId })
@@ -105,9 +96,9 @@ public sealed class CasesController : ControllerBase
                     return new { latest.NoteId, latest.NoteDate, latest.ChartNoteId };
                 });
 
-        // ChiroTouch stores NoteDate as a date only (always midnight), so the
-        // real "when it came in" clock is the signature timestamp. Pull the
-        // signed time for each case's latest note so LastNoteDate can show it.
+        // ChiroTouch stores NoteDate as date-only (midnight), so the real "when
+        // it came in" clock is the signature timestamp. Pull the signed time for
+        // each case's latest note so LastNoteDate can show it.
         var latestChartNoteIds = latestNotePerCase.Values
             .Where(v => v.ChartNoteId.HasValue)
             .Select(v => v.ChartNoteId!.Value)
@@ -117,11 +108,10 @@ public sealed class CasesController : ControllerBase
             ? await _detail.GetSignedTimesAsync(latestChartNoteIds)
             : new Dictionary<int, DateTime>();
 
-        // Dashboard rollup: verdict of the LATEST NOTE's most recent scrub
-        // (not "latest scrub run across notes"). Matches the user rule
-        // "workflow table always deals with the last note and scrub result."
-        // Older notes' verdicts still surface in Doctor Queue / Human Review,
-        // which filter independently.
+        // Dashboard rollup: verdict of the LATEST NOTE's most recent scrub (not
+        // "latest scrub across notes") — per the rule "workflow table always
+        // deals with the last note and scrub result." Older notes still surface
+        // in Doctor Queue / Human Review, which filter independently.
         var scrubByCase = latestByNote
             .Where(s => latestNotePerCase.TryGetValue(s.WorkflowCaseId, out var latest)
                         && latest.NoteId == s.NoteId)
@@ -131,21 +121,19 @@ public sealed class CasesController : ControllerBase
 
         // Two complementary signals:
         //  - outstandingByPatient: count of UNBILLED charges (no BilledCharges
-        //    row). Drives state transitions — ReadyForBilling requires "new
-        //    work to claim" (unbilled > 0), AwaitingCharges otherwise.
-        //  - insuranceByPatient: full insurance balance (unbilled + AR).
-        //    Drives the dashboard chip — what insurance still owes us total.
-        //    "All billed" was misleading when AR was sitting unpaid; the chip
-        //    now shows the real dollar amount we can still collect against.
+        //    row). Drives state transitions — ReadyForBilling requires unbilled
+        //    > 0, AwaitingCharges otherwise.
+        //  - insuranceByPatient: full insurance balance (unbilled + AR). Drives
+        //    the dashboard chip. "All billed" was misleading when AR sat unpaid;
+        //    the chip now shows the real collectible dollar amount.
         var outstandingByPatient = _detail.IsConfigured
             ? await _detail.GetOutstandingChargesAsync(patientIds)
             : new Dictionary<int, OutstandingChargesSummary>();
         var insuranceByPatient = _detail.IsConfigured
             ? await _detail.GetInsuranceBalancesAsync(patientIds)
             : new Dictionary<int, decimal>();
-        // Team identifies patients by AccountNo, not the internal Patients.ID.
-        // Pulled in batch and surfaced on the dashboard alongside the PK so
-        // both stay clickable while staff learn the new portal.
+        // Team identifies patients by AccountNo, not the internal Patients.ID —
+        // surfaced alongside the PK while staff learn the new portal.
         var accountByPatient = _detail.IsConfigured
             ? await _detail.GetAccountNumbersAsync(patientIds)
             : new Dictionary<int, int>();
@@ -153,6 +141,13 @@ public sealed class CasesController : ControllerBase
         var officeByPatient = _detail.IsConfigured
             ? await _detail.GetOfficesAsync(patientIds)
             : new Dictionary<int, string>();
+        // Missing-note visits per patient — Appointments with billed service
+        // charges but no matching ChartNote by that doctor on that date.
+        // Surfaces the gap Jacob flagged (Wilson 6/23 Saias: 4 CPTs billed, no
+        // note written).
+        var missingNotesByPatient = _detail.IsConfigured
+            ? await _detail.GetMissingNoteVisitCountsAsync(patientIds)
+            : new Dictionary<int, int>();
 
         var rows = cases.Select(c =>
         {
@@ -163,9 +158,9 @@ public sealed class CasesController : ControllerBase
             outstandingByPatient.TryGetValue(c.PatientId, out var outstanding);
             var insuranceBalance = insuranceByPatient.GetValueOrDefault(c.PatientId);
 
-            // "Last note" timestamp: prefer the latest note's signed time (the
-            // real clock), fall back to its clinical NoteDate (carries a time
-            // only for portal-injected notes), then to the workflow stamp.
+            // "Last note" timestamp: prefer the signed time (real clock), fall
+            // back to NoteDate (has a time only for portal-injected notes), then
+            // to the workflow stamp.
             var latestNote = latestNotePerCase.GetValueOrDefault(c.Id);
             DateTime? lastNoteStamp = null;
             if (latestNote?.ChartNoteId is int cnId && signedTimes.TryGetValue(cnId, out var sigAt))
@@ -183,34 +178,30 @@ public sealed class CasesController : ControllerBase
                 LatestScrubAt: scrub?.RanAt,
                 OutstandingChargesCount: outstanding?.Count ?? 0,
                 // Repurposed: this field now carries the full insurance balance
-                // (unbilled + AR), not just unbilled charges. The frontend
-                // chip reads it as "what insurance owes us total".
+                // (unbilled + AR), not just unbilled charges.
                 OutstandingChargesTotal: insuranceBalance,
                 OldestOutstandingChargeDate: outstanding?.OldestChargeDate,
-                // Clinical date + time of the latest note, as stored (clinic-
-                // local wall clock). Sortable "yyyy-MM-dd HH:mm:ss" so the string
-                // sort in ApplySort stays chronological; the dashboard formatter
-                // (formatNoteStamp) renders it from the parts so the wall clock
-                // can't shift across timezones.
+                // Latest note's clinical date+time, clinic-local wall clock.
+                // Sortable "yyyy-MM-dd HH:mm:ss" so the string sort stays
+                // chronological; formatNoteStamp renders from the parts so the
+                // wall clock can't shift across timezones.
                 LastNoteDate: lastNoteStamp?.ToString("yyyy-MM-dd HH:mm:ss"),
-                // Latest note's DoctorNote.Id — exposed so the dashboard's
-                // "Scrub now" button can fire POST /notes/{id}/scrub for the
-                // most recent note when auto-scrub is paused for cost control.
+                // Latest note's DoctorNote.Id — drives the "Scrub now" button
+                // (POST /notes/{id}/scrub) when auto-scrub is paused for cost.
                 LatestDoctorNoteId: latestNotePerCase.GetValueOrDefault(c.Id)?.NoteId,
                 AccountNo: accountByPatient.TryGetValue(c.PatientId, out var acct) ? acct : (int?)null,
-                Office: officeByPatient.GetValueOrDefault(c.PatientId, OfficeResolver.Main));
+                Office: officeByPatient.GetValueOrDefault(c.PatientId, OfficeResolver.Main),
+                MissingNoteVisitCount: missingNotesByPatient.GetValueOrDefault(c.PatientId, 0));
         }).ToList();
 
-        // Office filter (react-admin ?filter={"office":"Center City"}). Applied
-        // before total/sort/paginate so the Content-Range total reflects the
-        // filtered set and pagination stays correct.
+        // Office filter (react-admin ?filter={"office":"..."}). Applied before
+        // total/sort/paginate so Content-Range reflects the filtered set.
         if (!string.IsNullOrWhiteSpace(officeFilter))
             rows = rows.Where(r => string.Equals(r.Office, officeFilter, StringComparison.OrdinalIgnoreCase)).ToList();
 
         var total = rows.Count;
         rows = ApplySort(rows, sortField, sortDesc);
 
-        // Paginate after sort — react-admin's range is over the sorted result.
         var page = rows.Skip(skip).Take(take).ToList();
         var last = total == 0 ? 0 : Math.Min(skip + page.Count - 1, total - 1);
         Response.Headers["Content-Range"] = $"cases {skip}-{last}/{total}";
@@ -252,14 +243,13 @@ public sealed class CasesController : ControllerBase
         return ("lastUpdatedAt", true);
     }
 
-    // Sort the dashboard rows by the requested field. Unknown fields fall back
-    // to LastUpdatedAt — never throw, just keep the dashboard responsive.
-    // Null values sort last regardless of direction (so "Scrub pending" /
-    // "All paid" rows don't crowd the top when sorting on those columns).
+    // Sort dashboard rows. Unknown fields fall back to LastUpdatedAt (never
+    // throw). Nulls sort last regardless of direction so "Scrub pending" /
+    // "All paid" rows don't crowd the top.
     private static List<CaseDto> ApplySort(List<CaseDto> rows, string field, bool desc)
     {
-        // Explicit nullable casts on non-nullable value-type fields so C#
-        // overload resolution picks the struct-key Order helper.
+        // Explicit nullable casts on non-nullable value-type fields so overload
+        // resolution picks the struct-key Order helper.
         IOrderedEnumerable<CaseDto> sorted = field.ToLowerInvariant() switch
         {
             "patientid"               => Order(rows, r => (int?)r.PatientId, desc),
@@ -270,6 +260,7 @@ public sealed class CasesController : ControllerBase
             "lastnotedate"            => Order(rows, r => r.LastNoteDate, desc),
             "latestscrubat"           => Order(rows, r => r.LatestScrubAt, desc),
             "outstandingchargestotal" => Order(rows, r => (decimal?)r.OutstandingChargesTotal, desc),
+            "missingnotevisitcount"   => Order(rows, r => (int?)r.MissingNoteVisitCount, desc),
             "office"                  => Order(rows, r => r.Office, desc),
             "currentstate"            => Order(rows, r => r.CurrentState, desc),
             "addedat"                 => Order(rows, r => (DateTime?)r.AddedAt, desc),
@@ -279,8 +270,8 @@ public sealed class CasesController : ControllerBase
         return sorted.ToList();
     }
 
-    // Direction-aware ordering with nulls always at the bottom — for date /
-    // string columns where "missing" should never be confused with "extreme".
+    // Direction-aware ordering with nulls always at the bottom — so "missing"
+    // is never confused with "extreme".
     private static IOrderedEnumerable<CaseDto> Order<TKey>(
         List<CaseDto> rows, Func<CaseDto, TKey?> keySelector, bool desc) where TKey : struct
     {
@@ -306,46 +297,42 @@ public sealed class CasesController : ControllerBase
         if (demo is null) return NotFound();
 
         var policies = await _detail.GetPoliciesAsync(id);
-        // Pull up to 50 notes — patient history is sometimes deep and the tab UI
-        // scrolls horizontally so the cost is mostly in the SQL roundtrip.
+        // Cap at 50 notes — history can be deep; cost is mostly the SQL roundtrip.
         var noteRows = await _detail.GetRecentNotesAsync(id, 50);
         // Charges for the visits the recent notes matched into — mirrors how
-        // ChiroTouch shows the bill alongside the notes the reviewer is reading.
+        // ChiroTouch shows the bill alongside the notes.
         var matchedVisitIds = noteRows
             .Where(n => n.VisitId.HasValue)
             .Select(n => n.VisitId!.Value)
             .ToList();
         var chargeRows = await _detail.GetChargesForVisitsAsync(matchedVisitIds);
 
-        // Diagnoses, scoped per visit. ChiroTouch's chart-note DX panel shows the
-        // diagnosis set for that note's appointment (in Seq order), not the
-        // patient's whole history — so group by appointment and attach each set to
-        // its note rather than emitting a single patient-wide list.
+        // Diagnoses scoped per visit: ChiroTouch's DX panel shows the set for
+        // that note's appointment (Seq order), not the patient's whole history —
+        // so group by appointment and attach each set to its note.
         var diagnosesByVisit = (await _detail.GetDiagnosesForVisitsAsync(matchedVisitIds))
             .GroupBy(d => d.AppointmentId)
             .ToDictionary(
                 g => g.Key,
                 g => g.Select(d => (object)new { code = d.Code, description = d.Description }).ToList());
 
-        // Pull cached PlainText from our DoctorNote table in a single query so
-        // every note (not just the first 3) can display its body. Worker
-        // reconstructs and stores PlainText on sync, so this is the fast path.
-        // ChartNoteId is nullable on DoctorNote (portal-authored corrections
-        // have null), so filter those out of this lookup — they're surfaced
-        // separately below.
+        // Cached PlainText from DoctorNote in one query so every note can show
+        // its body (worker stores PlainText on sync — the fast path). Filter out
+        // null ChartNoteId (portal-authored corrections) — surfaced separately
+        // below.
         var chartNoteIds = noteRows.Select(n => n.Id).ToArray();
         await using var noteDb = await _factory.CreateDbContextAsync();
-        // Pull both PlainText AND our internal DoctorNote.Id keyed by ChartNoteId
-        // so each note tab can carry its own latestScrub.
+        // Key PlainText + internal DoctorNote.Id by ChartNoteId so each tab
+        // carries its own latestScrub.
         var doctorNoteByChartId = await noteDb.DoctorNotes
             .AsNoTracking()
             .Where(n => n.ChartNoteId.HasValue && chartNoteIds.Contains(n.ChartNoteId.Value))
-            .Select(n => new { ChartNoteId = n.ChartNoteId!.Value, n.Id, n.PlainText })
-            .ToDictionaryAsync(n => n.ChartNoteId, n => new { n.Id, n.PlainText });
+            .Select(n => new { ChartNoteId = n.ChartNoteId!.Value, n.Id, n.PlainText, n.RawRtf })
+            .ToDictionaryAsync(n => n.ChartNoteId, n => new { n.Id, n.PlainText, n.RawRtf });
 
-        // Build a doctorNoteId -> latest ScrubResult dictionary for the whole
-        // patient so the per-tab ScrubPanel can render without a follow-up
-        // fetch. Same dictionary feeds the case-level rollup below.
+        // doctorNoteId -> latest ScrubResult for the whole patient so the per-tab
+        // ScrubPanel renders without a follow-up fetch. Also feeds the case-level
+        // rollup below.
         var patientLatestPerNote = new Dictionary<int, ScrubResult>();
         var allPatientScrubs = await noteDb.ScrubResults.AsNoTracking()
             .Where(s => s.DoctorNoteId != null
@@ -361,10 +348,9 @@ public sealed class CasesController : ControllerBase
         object? ScrubProj(int? doctorNoteId)
         {
             if (doctorNoteId is null || !patientLatestPerNote.TryGetValue(doctorNoteId.Value, out var s)) return null;
-            // Inline the full findings object so the ScrubPanel can render
-            // section breakdowns + issues without a follow-up fetch. Without
-            // this, the panel only had verdict + summary and "the detail"
-            // for failures didn't appear.
+            // Inline the full findings so the ScrubPanel can render section
+            // breakdowns + issues without a follow-up fetch (was verdict +
+            // summary only, so failure detail didn't appear).
             return new
             {
                 id = s.Id,
@@ -383,23 +369,32 @@ public sealed class CasesController : ControllerBase
                 ? null
                 : (object?)JsonSerializer.Deserialize<JsonElement>(json);
 
-        // Build the combined notes list with a typed envelope so we can sort
-        // chart + portal notes together without reflection.
+        // Typed envelope so we can sort chart + portal notes together without
+        // reflection.
         var noteCards = new List<NoteCard>();
 
         foreach (var n in noteRows)
         {
             var cached = doctorNoteByChartId.GetValueOrDefault(n.Id);
             string? text = cached?.PlainText;
+            string? rawRtf = cached?.RawRtf;
             int? doctorNoteId = cached?.Id;
-            // Live fallback for notes we haven't cached yet (existing patients
-            // whose history pre-dates the sync). Slow but bounded per page;
-            // task #43's historical backfill makes this path rare.
+            // Live fallback for uncached notes (patients whose history pre-dates
+            // the sync). Slow but bounded per page; task #43's historical
+            // backfill makes this path rare.
             if (text is null && n.SoapPtr is int ptr and not 0)
             {
-                try { text = RtfConverter.ToPlainText(await _noteReads.GetNoteRtfAsync(ptr)); }
+                try
+                {
+                    rawRtf = await _noteReads.GetNoteRtfAsync(ptr);
+                    text = RtfConverter.ToPlainText(rawRtf);
+                }
                 catch { text = null; }
             }
+            // Colored/bold runs so the portal note matches ChiroTouch's
+            // formatting (blue/red). Null when not RTF — client falls back to
+            // plainText.
+            var richBody = RtfRichConverter.ToRuns(rawRtf);
             var (matchScore, matchReasons) = ScoreVisitMatch(n);
 
             noteCards.Add(new NoteCard(n.NoteDate, new
@@ -407,12 +402,13 @@ public sealed class CasesController : ControllerBase
                 id = n.Id,
                 source = "chart",
                 doctorNoteId,
-                // Clinical date as "yyyy-MM-dd" — keeps the client from
-                // shifting midnight-UTC into the previous EDT evening.
+                // "yyyy-MM-dd" keeps the client from shifting midnight-UTC into
+                // the previous EDT evening.
                 noteDate = n.NoteDate?.ToString("yyyy-MM-dd"),
                 doctor = n.Doctor,
                 status = n.Status,
                 plainText = text,
+                richBody,
                 visitId = n.VisitId,
                 visitTime = n.VisitTime,
                 visitCheckIn = n.VisitCheckIn,
@@ -432,12 +428,10 @@ public sealed class CasesController : ControllerBase
             }));
         }
 
-        // Portal-authored corrections (no PSChiro ChartNote). Doctor authored
-        // these inside our portal in response to a failed scrub; they belong
-        // alongside the chart notes in the tabs so the reviewer sees the full
-        // history. Each carries its latest scrub inline so the tab renders
-        // without a follow-up fetch — there's no ChartNoteId for the existing
-        // scrub endpoint to key off of.
+        // Portal-authored corrections (no PSChiro ChartNote), authored in
+        // response to a failed scrub; shown alongside chart notes for full
+        // history. Latest scrub inlined (no ChartNoteId for the scrub endpoint
+        // to key off of).
         var portalNotes = await noteDb.DoctorNotes
             .AsNoTracking()
             .Where(n => n.PatientId == id && n.ChartNoteId == null)
@@ -468,8 +462,7 @@ public sealed class CasesController : ControllerBase
                 noteCards.Add(new NoteCard(p.NoteDate, new
                 {
                     // Negative id keeps tab keys unique against chart-note IDs
-                    // (positive ints from PSChiro). The frontend doesn't read
-                    // the value beyond uniqueness.
+                    // (positive PSChiro ints); frontend only uses it for uniqueness.
                     id = -p.Id,
                     source = "portal",
                     portalNoteId = p.Id,
@@ -512,9 +505,8 @@ public sealed class CasesController : ControllerBase
             })
             .FirstOrDefaultAsync();
 
-        // Latest note by clinical NoteDate (tiebreak on Id) — same rule as
-        // the dashboard rollup. Drives both the case-level scrub headline
-        // and the state derivation below.
+        // Latest note by NoteDate (tiebreak on Id) — same rule as the dashboard
+        // rollup. Drives the case-level scrub headline and state derivation.
         var latestDoctorNoteId = await noteDb.DoctorNotes.AsNoTracking()
             .Where(n => n.PatientId == id)
             .OrderByDescending(n => n.NoteDate).ThenByDescending(n => n.Id)
@@ -525,10 +517,9 @@ public sealed class CasesController : ControllerBase
         if (latestDoctorNoteId.HasValue)
             patientLatestPerNote.TryGetValue(latestDoctorNoteId.Value, out latestNoteScrub);
 
-        // Case rollup: verdict of the LATEST NOTE's most recent scrub. The
-        // counts (pass / needs_review / fail) stay alongside as context so
-        // the reviewer sees "today's note passed, but 2 older ones need
-        // review" at a glance — the headline still mirrors the dashboard.
+        // Case rollup: verdict of the LATEST NOTE's most recent scrub. Counts
+        // (pass / needs_review / fail) ride alongside as context ("today passed,
+        // but 2 older ones need review") while the headline mirrors the dashboard.
         object? caseScrubSummary = null;
         if (patientLatestPerNote.Count > 0)
         {
@@ -549,9 +540,9 @@ public sealed class CasesController : ControllerBase
         var insurance = policies.Count > 0;
         var hasNotes = noteRows.Count > 0;
         var pip = wc?.PipVerifiedAt != null;
-        // Always derive from the live ChiroTouch truth so the detail can't drift
-        // from a stale stored state. Same upgrade-to-ReadyForBilling rule as
-        // the dashboard: latest-NOTE scrub passed + insurance still owes money.
+        // Always derive from live ChiroTouch truth so the detail can't drift
+        // from stale stored state. Same upgrade-to-ReadyForBilling rule as the
+        // dashboard: latest-NOTE scrub passed + insurance still owes money.
         var insuranceBalanceDetail = _detail.IsConfigured
             ? (await _detail.GetInsuranceBalancesAsync(new[] { id }))
                 .GetValueOrDefault(id)
@@ -579,8 +570,8 @@ public sealed class CasesController : ControllerBase
             insuranceProvided = insurance,
             doctorNotesReceived = hasNotes,
             pipVerified = pip,
-            // Clinical calendar dates (insurance effective / latest note) — emit as
-            // date-only so the portal shows the real day without a timezone shift.
+            // Clinical calendar dates — emit as date-only so the portal shows
+            // the real day without a timezone shift.
             insuranceAddedAt = wc?.InsuranceAddedAt?.ToString("yyyy-MM-dd"),
             doctorNotesReceivedAt = wc?.DoctorNotesReceivedAt?.ToString("yyyy-MM-dd"),
             pipVerifiedAt = wc?.PipVerifiedAt,
@@ -628,23 +619,17 @@ public sealed class CasesController : ControllerBase
         var wc = await db.WorkflowCases.FirstOrDefaultAsync(c => c.PatientId == id, ct);
         if (wc is null) return NotFound(new { error = $"No workflow case for patient {id}." });
 
-        // Look up the original failing note so the PSChiro writeback can
-        // reuse its date + doctor. ChiroTouch's UI is appointment-anchored,
-        // so a correction must land on the same DOS as the original note's
-        // visit to appear in the chart.
-        //
-        // Two-step lookup:
-        //   1. Use the explicit OriginalDoctorNoteId from the modal if present
-        //   2. Fall back to "patient's most recent failing per-note scrub"
-        //      so the flow still works even if the frontend didn't supply it
+        // Look up the original failing note so the writeback reuses its date +
+        // doctor. ChiroTouch is appointment-anchored — a correction must land on
+        // the same DOS as the original visit to appear in the chart. Prefer the
+        // explicit OriginalDoctorNoteId; else fall back to the patient's most
+        // recent failing per-note scrub.
         DoctorNote? original = req.OriginalDoctorNoteId.HasValue
             ? await _cases.GetDoctorNoteByIdAsync(req.OriginalDoctorNoteId.Value)
             : null;
 
         if (original is null)
         {
-            // Find the most recent failing per-note scrub for this patient
-            // and use that note as the implicit "original."
             var recentFailNoteId = await db.ScrubResults.AsNoTracking()
                 .Where(s => s.DoctorNoteId != null
                             && s.Verdict == ScrubVerdicts.Fail
@@ -656,9 +641,8 @@ public sealed class CasesController : ControllerBase
                 original = await _cases.GetDoctorNoteByIdAsync(recentFailNoteId.Value);
         }
 
-        // Doctor attribution: the correction is recorded as the ORIGINAL
-        // note's doctor (we're correcting their work in their name). Falls
-        // back to req.DoctorId, then to "no doctor" for portal-only cases.
+        // Attribution: correction is recorded under the ORIGINAL note's doctor
+        // (their work, their name). Falls back to req.DoctorId, then no doctor.
         var attributedDoctorId = original?.DoctorId ?? req.DoctorId;
         var attributedNoteDate = original?.NoteDate ?? req.NoteDate;
 
@@ -669,13 +653,11 @@ public sealed class CasesController : ControllerBase
             text: req.Text.Trim(),
             noteDate: attributedNoteDate);
 
-        // PSChiro writeback. Preferred path when we have the original
-        // ChartNoteId: UPDATE the existing note's body in place — preserves
-        // CT metadata (note id, signature, appointment linkage) and avoids
-        // duplicate notes for the same DOS. Fallback to INSERT a new
-        // ChartNote only when the original has no ChartNoteId (rare:
-        // chain-of-corrections where the prior correction was itself
-        // portal-authored).
+        // PSChiro writeback. With the original ChartNoteId: UPDATE the body in
+        // place — preserves CT metadata (note id, signature, appointment link)
+        // and avoids duplicate notes for the same DOS. INSERT a new ChartNote
+        // only when there's no ChartNoteId (rare: chained portal-authored
+        // corrections).
         int? writebackChartNoteId = null;
         if (_pschiroWrite.IsConfigured)
         {
@@ -710,16 +692,14 @@ public sealed class CasesController : ControllerBase
             }
         }
 
-        // Open kickbacks resolved — the doctor just responded, regardless of
-        // whether the next scrub passes or fails (it might still fail, in
-        // which case the case stays in the review queue for human follow-up).
+        // Resolve open kickbacks — the doctor responded, regardless of whether
+        // the next scrub passes (if it fails, the case stays in review for
+        // human follow-up).
         await _corrections.ResolveOpenForPatientAsync(id, ct);
 
-        // Re-scrub fires in the background so the doctor doesn't wait the
-        // full Claude round-trip (5-15s). The scrub result lands in the queue
-        // and refreshes the case's rolled-up verdict on its own — the doctor
-        // doesn't need to see it in the modal. Captures the scrub orchestrator
-        // by reference (singleton-scoped) and the doctor note id by value.
+        // Re-scrub in the background so the doctor doesn't wait the Claude
+        // round-trip (5-15s); the result refreshes the rolled-up verdict on its
+        // own. Captures the orchestrator by reference and the note id by value.
         var noteIdForScrub = doctorNoteId;
         var scrubs = _scrubs;
         var logger = _logger;
@@ -727,9 +707,8 @@ public sealed class CasesController : ControllerBase
         {
             try
             {
-                // Respect the master kill-switch — when AutoScrub is disabled
-                // (cost control), the corrected note stays as "Scrub pending"
-                // until the operator manually fires it.
+                // Master kill-switch — when AutoScrub is disabled (cost control),
+                // the note stays "Scrub pending" until fired manually.
                 if (!scrubs.AutoScrubEnabled)
                 {
                     logger.LogInformation(
@@ -770,16 +749,14 @@ public sealed class CasesController : ControllerBase
         return Ok(new { id, patientId = id, pipVerified = true, pipVerifiedAt = verified });
     }
 
-    // Dashboard/detail state derivation. Cascade: insurance → notes →
-    // ReadyForAiScrubbing → (pass + insurance owes us) ReadyForBilling, or
-    // (pass + insurance owes nothing) AwaitingCharges. Per-appointment state
-    // (one per visit, not one per patient) is the proper fix — tracked as
-    // task #53; this read-time derivation is the bridge.
+    // State derivation cascade: insurance → notes → ReadyForAiScrubbing →
+    // (pass + insurance owes us) ReadyForBilling, else (pass + owes nothing)
+    // AwaitingCharges. Per-appointment state is the proper fix (task #53); this
+    // read-time derivation is the bridge.
     //
-    // Gates on insurance balance (unbilled + AR), not just unbilled count —
-    // a case with all claims sent but $$ in AR is still "ReadyForBilling"
-    // from a billing-team perspective (collectible work). AwaitingCharges
-    // means "clean slate, waiting for next visit's charges to land".
+    // Gates on insurance balance (unbilled + AR), not just unbilled count — a
+    // case with all claims sent but $$ in AR is still ReadyForBilling
+    // (collectible). AwaitingCharges = clean slate, waiting for next charges.
     private static string DeriveDashboardState(
         bool insurance, bool pip, bool notes, string? latestScrubVerdict, decimal insuranceBalance)
     {
@@ -808,8 +785,8 @@ public sealed class CasesController : ControllerBase
         return (0, 25);
     }
 
-    // Heuristic note->visit match score (0-100). Start at 100, deduct per weakness;
-    // tune the weights here as Jacob calibrates against real reviews.
+    // Heuristic note->visit match score (0-100). Start at 100, deduct per
+    // weakness; tune the weights as Jacob calibrates against real reviews.
     private static (int Score, IReadOnlyList<string> Reasons) ScoreVisitMatch(ChartNoteRow n)
     {
         var reasons = new List<string>();
@@ -848,19 +825,17 @@ public sealed class CasesController : ControllerBase
     }
 }
 
-// Doctor-authored correction note from the portal. OriginalDoctorNoteId, when
-// provided, anchors the correction to a specific failing note — its date and
-// doctor are reused for the PSChiro writeback so the correction lands on the
-// same visit (ChiroTouch's UI is appointment-anchored).
+// Doctor-authored correction note from the portal. OriginalDoctorNoteId anchors
+// the correction to a specific failing note — its date + doctor are reused for
+// the writeback so it lands on the same visit (ChiroTouch is appointment-anchored).
 public record AuthorCorrectedNoteRequest(
     int? DoctorId,
     string Text,
     DateTime? NoteDate,
     int? OriginalDoctorNoteId);
 
-// Internal envelope used by GetCase to interleave chart notes and portal-authored
-// corrections by date before serializing. Payload is the per-note anonymous object
-// the frontend consumes.
+// Envelope used by GetCase to interleave chart + portal notes by date before
+// serializing. Payload is the per-note object the frontend consumes.
 internal sealed record NoteCard(DateTime? NoteDate, object Payload);
 
 // Dashboard row (serialized to camelCase; id == PatientId).
@@ -878,27 +853,29 @@ public record CaseDto(
     DateTime? PipVerifiedAt,
     DateTime AddedAt,
     DateTime LastUpdatedAt,
-    // Case-level scrub verdict. Null when no case scrub has run yet so the
-    // dashboard can render "Not scrubbed" distinctly from a verdict.
+    // Case-level scrub verdict. Null when no scrub has run so the dashboard can
+    // render "Not scrubbed" distinctly from a verdict.
     string? LatestScrubVerdict,
     DateTime? LatestScrubAt,
-    // Outstanding (unbilled) service charges for the patient — the third
-    // billing-readiness gate. Count == 0 means "nothing to bill right now".
+    // Outstanding (unbilled) charges — the third billing-readiness gate.
+    // Count == 0 means nothing to bill right now.
     int OutstandingChargesCount,
     decimal OutstandingChargesTotal,
     DateTime? OldestOutstandingChargeDate,
-    // Most recent chart note's clinical date as "yyyy-MM-dd" — calendar date,
-    // not a timestamp. Emitting as a plain date string keeps the client from
-    // shifting it to the previous evening in EDT (midnight-UTC quirk).
+    // Latest note's clinical date as "yyyy-MM-dd" (calendar date, not a
+    // timestamp) — plain date string keeps the client from shifting it to the
+    // previous EDT evening (midnight-UTC quirk).
     string? LastNoteDate,
-    // Internal DoctorNote.Id of the latest note (drives the manual "Scrub now"
-    // button on rows where verdict is pending). Null when the case has no
-    // notes yet.
+    // Latest note's DoctorNote.Id — drives the manual "Scrub now" button on
+    // pending rows. Null when the case has no notes yet.
     int? LatestDoctorNoteId,
-    // PSChiro AccountNo — the human-facing ID the team uses to identify
-    // patients. Surfaced on the dashboard alongside the internal Patients.ID
-    // so staff aren't forced to memorize new keys.
+    // PSChiro AccountNo — the human-facing ID the team uses. Surfaced alongside
+    // Patients.ID so staff needn't memorize new keys.
     int? AccountNo,
-    // Canonical office label (patient's primary provider's facility). Drives the
-    // dashboard Office column + the office filter. See OfficeResolver.
-    string? Office);
+    // Canonical office label (primary provider's facility). Drives the Office
+    // column + filter. See OfficeResolver.
+    string? Office,
+    // Count of (date, doctor) billable visits with service charges but no
+    // matching ChartNote. Non-zero = biller must chase missing documentation.
+    // See GetMissingNoteVisitCountsAsync for the detection rule.
+    int MissingNoteVisitCount);

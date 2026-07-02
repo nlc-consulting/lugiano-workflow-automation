@@ -15,12 +15,41 @@ public static class RtfConverter
 
         try
         {
-            return Parse(rtf);
+            return StripKnownLetterhead(Parse(rtf));
         }
         catch
         {
             return null;
         }
+    }
+
+    // Some note templates embed the clinic letterhead INSIDE the RTF (address,
+    // phones, associated doctors' names, practice URL). ChiroTouch hides it as
+    // a page header, but our plain-text conversion pulls it in verbatim (e.g.
+    // Dr. Wood's note showing the URL + Dr. Gupta/Dr. DiRenzo before content).
+    // Letterhead ends with the practice URL, so strip through the last URL
+    // occurrence in the first ~2000 chars. Fall through unchanged if not found
+    // in that window — that note has no letterhead template.
+    private static string StripKnownLetterhead(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return text;
+        // Known clinic URL — the reliable delimiter between letterhead and body.
+        // If the practice ever rebrands, add additional URLs to this list.
+        string[] letterheadUrls = { "papainandrehab.com" };
+        var searchWindow = Math.Min(2000, text.Length);
+        int lastIndex = -1;
+        int lastLen = 0;
+        foreach (var url in letterheadUrls)
+        {
+            var idx = text.LastIndexOf(url, searchWindow - 1, searchWindow, StringComparison.OrdinalIgnoreCase);
+            if (idx > lastIndex)
+            {
+                lastIndex = idx;
+                lastLen = url.Length;
+            }
+        }
+        if (lastIndex < 0) return text;
+        return text[(lastIndex + lastLen)..].TrimStart();
     }
 
     private static string Parse(string rtf)

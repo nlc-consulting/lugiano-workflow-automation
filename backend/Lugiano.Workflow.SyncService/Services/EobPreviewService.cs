@@ -23,11 +23,9 @@ public sealed class EobPreviewService
     public async Task<EobPreviewResult> PreviewAsync(Stream xlsxStream, CancellationToken ct)
     {
         var allLines = ParseWorkbook(xlsxStream);
-        // Drop noise rows: nothing to post if the carrier paid $0 AND wrote
-        // off $0 on the line. These are typically pending claims or pure
-        // information lines on the EOB — they'd never produce a CT posting
-        // anyway. Filtering here keeps the preview focused on actionable
-        // lines and the counts honest.
+        // Drop noise rows: paid $0 AND written-off $0 lines (pending claims or
+        // pure info lines) never produce a CT posting, so filtering keeps the
+        // preview focused and the counts honest.
         var lines = allLines
             .Where(l => l.PaidAmount > 0 || l.WriteOffAmount > 0)
             .ToList();
@@ -40,9 +38,8 @@ public sealed class EobPreviewService
                 Unmatched: Array.Empty<UnmatchedLine>());
         }
 
-        // Pre-fetch all candidate PSChiro charges in one round-trip — for each
-        // unique (PatientName-normalized, DOS, CPT) tuple we'll need to score
-        // against TranAmt. Names normalize to UPPER + collapsed whitespace.
+        // Distinct normalized patient names (UPPER + collapsed whitespace) for
+        // a single lookup round-trip.
         var distinctPatientNames = lines
             .Select(l => NormalizeName(l.PatientName))
             .Where(n => !string.IsNullOrEmpty(n))
@@ -51,21 +48,18 @@ public sealed class EobPreviewService
 
         await using var conn = _sourceDb.Create();
 
-        // Look up PSChiro patients by normalized name. ChiroTouch stores names
-        // as separate FirstName/LastName columns; we concatenate + normalize
-        // server-side so the IN filter stays cheap. Multiple Patients rows can
-        // share a name (case-per-injury model) — match returns ALL candidate
-        // patient ids per name; downstream join filters by DOS.
+        // Look up PSChiro patients by normalized name. Multiple Patients rows can
+        // share a name (case-per-injury), so this returns ALL candidate ids per
+        // name; the downstream join filters by DOS.
         var patientLookup = await LookupPatientsByNameAsync(conn, distinctPatientNames);
 
-        // For each EOB line, find candidate transactions.
         var matched = new List<MatchedLine>();
         var ambiguous = new List<AmbiguousLine>();
         var unmatched = new List<UnmatchedLine>();
 
-        // Cache fuzzy lookups per normalized EOB name so we don't re-query
-        // for every line of the same patient. Also remembers whether the
-        // top suggestion was confident enough to auto-resolve transactions.
+        // Cache fuzzy lookups per normalized name so we don't re-query every line
+        // of the same patient; also remembers whether the top suggestion was
+        // confident enough to auto-resolve.
         var fuzzyCache = new Dictionary<string, (IReadOnlyList<PatientSuggestion> Suggestions, int? AutoPatientId)>();
 
         foreach (var line in lines)
@@ -73,10 +67,9 @@ public sealed class EobPreviewService
             var normName = NormalizeName(line.PatientName);
             if (!patientLookup.TryGetValue(normName, out var patientIds) || patientIds.Count == 0)
             {
-                // Strict patient match failed. Try fuzzy + auto-resolve before
-                // dropping into Unmatched. Rule: ONE suggestion at score ≥ 95
-                // AND the per-line transaction match comes back clean (exact
-                // amount). Anything fuzzier stays as chips for human review.
+                // Strict match failed — try fuzzy + auto-resolve before Unmatched.
+                // Rule: ONE suggestion at score ≥ 95 AND a clean (exact-amount)
+                // transaction match. Anything fuzzier stays as chips for review.
                 if (!fuzzyCache.TryGetValue(normName, out var fuzzy))
                 {
                     var sugg = await SuggestPatientsAsync(line.PatientName);
@@ -98,17 +91,14 @@ public sealed class EobPreviewService
                     }
                     if (auto.Ambiguous is not null)
                     {
-                        // Fuzzy patient hit, but multiple txns share that
-                        // DOS+CPT. Operator picks which one.
+                        // Fuzzy hit but multiple txns share DOS+CPT — operator picks.
                         ambiguous.Add(auto.Ambiguous);
                         continue;
                     }
                     if (auto.Unmatched is not null)
                     {
-                        // Fuzzy patient hit, no transaction found at all.
-                        // Surface the specific "no transaction" reason but
-                        // keep the original suggestions so the operator can
-                        // try a different patient if our top guess is off.
+                        // Fuzzy hit but no transaction. Keep the original suggestions
+                        // so the operator can try a different patient if our top guess is off.
                         unmatched.Add(auto.Unmatched with { Suggestions = fuzzy.Suggestions });
                         continue;
                     }
@@ -118,10 +108,9 @@ public sealed class EobPreviewService
                 continue;
             }
 
-            // Charges with exact (patient, DOS, CPT, charge amount). Fast filter
-            // first, then score in memory. DOS comparison is date-only (CT's
-            // ledger view, our scrubber, and our existing join all use
-            // .Date — see PatientDetailQueries notes).
+            // Candidate charges by (patient, DOS, CPT); score amount in memory.
+            // DOS comparison is date-only (matches CT's ledger, our scrubber, and
+            // our joins — see PatientDetailQueries notes).
             var candidates = await conn.QueryAsync<TxCandidate>(
                 """
                 SELECT ID         AS TranId,
@@ -152,8 +141,7 @@ public sealed class EobPreviewService
                 continue;
             }
 
-            // Exact-amount filter (the cleanest match signal). If exactly one
-            // row matches on charge amount too, it's a 1.0-confidence match.
+            // Exact charge-amount match is the cleanest signal; exactly one = confident.
             var exactAmt = candList
                 .Where(c => c.TranAmt == line.IndividualCharge)
                 .ToList();
@@ -181,9 +169,9 @@ public sealed class EobPreviewService
             Unmatched: unmatched);
     }
 
-    // Parses an EOB Line Items workbook. Expects the 15-column schema from
-    // memory/reference_eob_samples.md (first row is header). Tolerates blank
-    // rows and missing optional columns; bails per-row on bad data.
+    // Parses an EOB Line Items workbook (15-column schema, header row first —
+    // see memory/reference_eob_samples.md). Tolerates blank rows and missing
+    // optional columns.
     private static List<EobLine> ParseWorkbook(Stream xlsxStream)
     {
         using var wb = new XLWorkbook(xlsxStream);
@@ -267,10 +255,8 @@ public sealed class EobPreviewService
         var result = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
         if (normalizedNames.Count == 0) return result;
 
-        // Pull all matching patients in one query — ChiroTouch's First/Last
-        // split + uppercase + whitespace collapse on the server. Multiple
-        // patient rows may share a name (case-per-injury), so the dict value
-        // is a list, not a single id.
+        // One query, server-side upper + whitespace collapse. Dict value is a
+        // list because multiple patient rows may share a name (case-per-injury).
         var rows = await conn.QueryAsync<(int Id, string? First, string? Last)>(
             """
             SELECT ID, FirstName, LastName
@@ -282,8 +268,7 @@ public sealed class EobPreviewService
 
         foreach (var r in rows)
         {
-            // Index under both First-Last and Last-First orderings so the
-            // EOB name shape doesn't matter.
+            // Index both First-Last and Last-First so EOB name shape doesn't matter.
             var fl = NormalizeName($"{r.First} {r.Last}");
             var lf = NormalizeName($"{r.Last} {r.First}");
             foreach (var key in new[] { fl, lf })
@@ -301,10 +286,8 @@ public sealed class EobPreviewService
     }
 
     // Patient lookup by ChiroTouch AccountNo — the operator's manual override
-    // when fuzzy suggestions miss. Returns null if no patient has that
-    // AccountNo. Used by the "Map to CT #" dialog: operator types the account
-    // number staff use day-to-day, we resolve it to the internal PSChiro
-    // PatientID and surface the matched patient for confirmation.
+    // when fuzzy suggestions miss (the "Map to CT #" dialog). Resolves the
+    // day-to-day account number to the internal PSChiro PatientID; null if none.
     public async Task<PatientLookupHit?> LookupPatientByAccountNoAsync(int accountNo, CancellationToken ct = default)
     {
         await using var conn = _sourceDb.Create();
@@ -321,10 +304,9 @@ public sealed class EobPreviewService
             new { accountNo });
     }
 
-    // Re-resolves a single EOB line against a chosen PSChiro patient — used
-    // when the operator clicks a fuzzy suggestion in the UI. Returns the
-    // line's new bucket (matched / ambiguous / still unmatched) so the
-    // frontend can move the row out of "Unmatched" and into the right place.
+    // Re-resolves one EOB line against a chosen PSChiro patient (operator clicked
+    // a fuzzy suggestion). Returns the line's new bucket (matched/ambiguous/
+    // unmatched) so the frontend can move the row out of "Unmatched".
     public async Task<EobResolveResult> ResolveLineWithPatientAsync(
         EobLine line, int patientId, CancellationToken ct = default)
     {
@@ -375,13 +357,10 @@ public sealed class EobPreviewService
             Unmatched: null);
     }
 
-    // Fuzzy patient suggestions for EOB lines whose name didn't strict-match.
-    // Strategy: try both name-order interpretations ("First Last" and
-    // "Last First" — the comma in "ZAMBRANO, AMADO" vs "AMADO ZAMBRANO"
-    // matters), pull a candidate set keyed on each token's first 3 chars
-    // (index-friendly), then rank in memory with Levenshtein distance.
-    // Suppress low-confidence matches entirely — surfacing wrong suggestions
-    // is worse than no suggestions.
+    // Fuzzy patient suggestions for lines that didn't strict-match. Tries both
+    // name orders ("First Last" / "Last First"), pulls candidates keyed on each
+    // token's first 3 chars, then ranks by Levenshtein. Suppresses low-confidence
+    // matches — a wrong suggestion is worse than none.
     public async Task<IReadOnlyList<PatientSuggestion>> SuggestPatientsAsync(string rawName)
     {
         if (string.IsNullOrWhiteSpace(rawName)) return Array.Empty<PatientSuggestion>();
@@ -391,32 +370,24 @@ public sealed class EobPreviewService
             .Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length == 0) return Array.Empty<PatientSuggestion>();
 
-        // Two candidate (last, first) interpretations of the input.
-        // Comma in raw -> author meant "Last, First" — that one wins.
-        // Otherwise default to "First Last" (last token = surname) since
-        // that's the dominant EOB convention. We score both and keep the
-        // better, so wrong guess is recoverable.
+        // Two (last, first) interpretations. Comma in raw => "Last, First" wins;
+        // otherwise default to "First Last" (dominant EOB convention). Both are
+        // scored and the better kept, so a wrong guess is recoverable.
         var ifComma = (Last: parts[0], First: parts.Length > 1 ? parts[^1] : "");
         var ifSpace = (Last: parts[^1], First: parts.Length > 1 ? parts[0] : "");
         var interps = hasComma ? new[] { ifComma, ifSpace } : new[] { ifSpace, ifComma };
 
-        // Pull candidates keyed on the first 3 chars of EITHER token —
-        // catches the "right surname, wrong order" case. Bounded TOP 100 so
-        // we never scan the whole patient table.
+        // Key candidates on the first 3 chars of EITHER token — catches the
+        // "right surname, wrong order" case.
         var tokens = parts.Distinct().Where(p => p.Length >= 3).ToList();
         if (tokens.Count == 0) return Array.Empty<PatientSuggestion>();
         var prefixes = tokens.Select(t => t[..3]).Distinct().ToList();
 
-        // Build the OR-clause dynamically — PSChiro is on SQL Server 2008
-        // compat level, so STRING_SPLIT (2016+) isn't available. Explicit
-        // @p0..@pN parameters keep it parameterized.
-        //
-        // Substring LIKE (%token%) catches patients with middle names that
-        // the EOB drops ("Amado" in EOB vs "Amado Mejia" in PSChiro) — the
-        // prefix-only LIKE missed those. Defeats indexes but the Patients
-        // table is small enough for a full scan per unique unmatched name.
-        // Also bumped TOP 100 -> 300 so we don't truncate older patient IDs
-        // when the prefix is common.
+        // Dynamic OR-clause with explicit @tN params — PSChiro is SQL Server 2008
+        // compat, so STRING_SPLIT (2016+) isn't available. Substring LIKE (%token%)
+        // catches EOB-dropped middle names ("Amado" vs "Amado Mejia"); defeats
+        // indexes but the Patients table is small. TOP raised 100->300 so common
+        // prefixes don't truncate older patient IDs.
         var args = new DynamicParameters();
         var clauses = new List<string>();
         for (int i = 0; i < tokens.Count; i++)
@@ -431,7 +402,7 @@ public sealed class EobPreviewService
             $"SELECT TOP 300 p.ID, p.FirstName, p.LastName FROM dbo.Patients p WHERE {whereSql} ORDER BY p.ID DESC;",
             args)).ToList();
 
-        // Score every candidate against every interpretation; keep the best.
+        // Score each candidate against each interpretation, keep the best.
         // Last-name match weighs 3x first-name (last names typo less often).
         var scored = new List<PatientSuggestion>();
         foreach (var r in rows)
@@ -446,9 +417,8 @@ public sealed class EobPreviewService
                 var combined = (lastSim * 3 + firstSim) / 4;
                 if (combined > best) best = combined;
             }
-            // Quality gate: only surface suggestions that are clearly close.
-            // 70 ≈ "one typo in either name" or "same surname, different
-            // first-name spelling". Below that = noise, drop it.
+            // Quality gate: 70 ≈ "one typo" or "same surname, different first-name
+            // spelling". Below that is noise, drop it.
             if (best >= 70)
                 scored.Add(new PatientSuggestion(
                     r.Id, $"{r.Last?.Trim()}, {r.First?.Trim()}".Trim(' ', ','), best));
@@ -461,18 +431,15 @@ public sealed class EobPreviewService
             .ToList();
     }
 
-    // Name similarity 0-100. Exact = 100; substring containment (e.g.
-    // EOB "Amado" vs PSChiro "Amado Mejia") = 95, since one is a clean
-    // prefix/suffix of the other and that's a much stronger signal than
-    // Levenshtein gives credit for; per-character edit drops the rest.
-    // Empty/null on either side returns 0.
+    // Name similarity 0-100. Exact = 100; substring containment (EOB "Amado" vs
+    // PSChiro "Amado Mejia") = 95, a stronger signal than Levenshtein credits;
+    // otherwise per-character edit distance. Empty/null on either side = 0.
     private static int NameSim(string a, string b)
     {
         if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return 0;
         if (a == b) return 100;
-        // Either is contained in the other — middle names, hyphenated
-        // surnames the EOB shortened, etc. Capped at 95 (not 100) so an
-        // exact match still beats a contained-substring match.
+        // Containment (dropped middle names, shortened hyphenated surnames).
+        // Capped at 95 so an exact match still outranks it.
         if (a.Contains(b) || b.Contains(a)) return 95;
         var d = Levenshtein(a, b);
         var maxLen = Math.Max(a.Length, b.Length);
@@ -504,11 +471,9 @@ public sealed class EobPreviewService
 
     private static string NormalizeName(string? raw)
     {
-        // EOB workbooks frequently use "Last, First" with a comma; PSChiro
-        // stores First/Last as separate columns we concatenate with a space.
-        // Strip punctuation (commas, periods, hyphens) to a single space
-        // before collapsing whitespace so both orderings normalize to the
-        // same shape ("TEST FAKEE" or "FAKEE TEST" — caller indexes both).
+        // Strip punctuation (commas/periods/hyphens) to spaces then collapse
+        // whitespace, so "Last, First" and space-separated forms normalize to
+        // the same shape (caller indexes both orderings).
         if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
         var cleaned = new string(raw.Select(c => char.IsLetterOrDigit(c) ? c : ' ').ToArray());
         return string.Join(' ', cleaned.ToUpperInvariant()
@@ -562,10 +527,9 @@ public sealed record ProposedUpdate(
 
 public sealed record MatchedLine(EobLine Line, TxCandidate Match, ProposedUpdate Proposed);
 public sealed record AmbiguousLine(EobLine Line, IReadOnlyList<TxCandidate> Candidates, string Reason);
-// Suggestions surface fuzzy patient-name matches for lines that the strict
-// name match missed. UI shows them as clickable chips; clicking re-runs the
-// match constrained to the chosen patient (via /eob/resolve-line) and
-// promotes the line into the right bucket.
+// Suggestions are fuzzy name matches for lines the strict match missed. UI shows
+// clickable chips; clicking re-runs via /eob/resolve-line constrained to the
+// chosen patient and promotes the line into the right bucket.
 public sealed record UnmatchedLine(
     EobLine Line,
     string Reason,

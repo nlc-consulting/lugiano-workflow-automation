@@ -25,4 +25,16 @@ public sealed class EobScanCheck
     // FK to the "other view" of the same payment. Symmetric — both rows of the
     // pair point at each other. Null when the EOB has only one stub.
     public int? PairedCheckId { get; set; }
+
+    // Confidence tier from the post-extraction scorer, which flags false
+    // positives (total-field misreads, MICR/header duplicates, blank-page
+    // hallucinations) WITHOUT dropping the row (biller may override on review).
+    //   "High"   — check# looks bank-valid, no duplicate. Counts toward clean total.
+    //   "Medium" — minor OCR noise (spaces/letter codes). Still in clean total.
+    //   "Low"    — likely hallucination/duplicate. EXCLUDED from clean total;
+    //              reason in HallucinationReason.
+    public string? Confidence { get; set; }
+
+    // When Confidence == "Low", short human-readable reason. Empty otherwise.
+    public string? HallucinationReason { get; set; }
 }

@@ -16,9 +16,8 @@ public sealed class HumanReviewController : ControllerBase
     public HumanReviewController(IDbContextFactory<WorkflowDbContext> factory) => _factory = factory;
 
     // GET /human-review — cases where a doctor-corrected (portal-authored)
-    // note STILL failed. Doctor's already had a chance; this is the escalation
-    // bucket for staff to review and either override the verdict or work the
-    // note manually.
+    // note STILL failed. Escalation bucket: staff override the verdict or work
+    // the note manually.
     [HttpGet]
     public async Task<IActionResult> GetReviewQueue([FromQuery] string? range)
     {

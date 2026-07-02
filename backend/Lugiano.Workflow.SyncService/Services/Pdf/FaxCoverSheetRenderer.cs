@@ -4,9 +4,9 @@ using QuestPDF.Infrastructure;
 
 namespace Lugiano.Workflow.SyncService.Services.Pdf;
 
-// Data needed to render one fax cover sheet. Composed by FaxService from
-// (patient, carrier, practice-config, today's date). Kept as a record so the
-// renderer stays stateless and the payload is trivially unit-testable.
+// Data to render one fax cover sheet. Composed by FaxService from (patient,
+// carrier, practice-config, today's date). A record so the renderer stays
+// stateless and the payload is unit-testable.
 public sealed record FaxCoverSheetData(
     // TO block — the carrier we're faxing to.
     string ToCompany,
@@ -27,14 +27,11 @@ public sealed record FaxCoverSheetData(
     string PagesText            // "See attached" or "1 + 3 pages", caller's call
 );
 
-// Renders the required HIPAA fax cover sheet as the FIRST page of an
-// outbound fax document. Every outbound fax (HCFA + Tracer) starts with this
-// so the confidentiality notice + recipient block are top-of-stack.
-//
-// Reasons this is a cover sheet requirement, not a footer on the last page:
-// intended-recipient handling matters BEFORE the recipient sees PHI. If the
-// fax lands in the wrong tray, the very first sheet says "if this isn't you,
-// stop reading and call us."
+// Renders the required HIPAA fax cover sheet as the FIRST page of every
+// outbound fax (HCFA + Tracer) so the confidentiality notice + recipient
+// block are top-of-stack. It's a cover, not a footer, because intended-
+// recipient handling matters BEFORE the recipient sees PHI: if the fax lands
+// in the wrong tray, page 1 says "if this isn't you, stop and call us."
 public static class FaxCoverSheetRenderer
 {
     // Standard HIPAA confidentiality wording. Reviewed against typical
@@ -66,7 +63,6 @@ public static class FaxCoverSheetRenderer
             {
                 col.Spacing(20);
 
-                // Header.
                 col.Item().AlignCenter().Text("FAX COVER SHEET")
                     .FontSize(24).Bold().LetterSpacing(0.02f);
                 col.Item().LineHorizontal(1).LineColor(Colors.Grey.Darken1);
@@ -87,7 +83,7 @@ public static class FaxCoverSheetRenderer
                         to.Item().PaddingTop(4).Text($"Fax: {data.ToFax}").SemiBold();
                     });
 
-                    row.ConstantItem(30);  // gap
+                    row.ConstantItem(30);
 
                     row.RelativeItem().Column(from =>
                     {
@@ -122,9 +118,8 @@ public static class FaxCoverSheetRenderer
                     });
                 });
 
-                // RE: block for patient identification (helps the recipient's
-                // filing/routing without exposing anything more than the
-                // HCFA/tracer inside would already show).
+                // RE: block for patient identification — exposes nothing more
+                // than the HCFA/tracer inside already shows.
                 col.Item().PaddingTop(6).Column(re =>
                 {
                     re.Item().Text("RE").FontSize(9).SemiBold().FontColor(Colors.Grey.Darken1);

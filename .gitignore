@@ -7,6 +7,10 @@
 *.local.json
 appsettings.*.local.json
 
+# Local deployment scratch (Cloudflare Tunnel configs, cert files,
+# provisioning scripts with embedded secrets — stays on this machine)
+deploy/
+
 # ─────────────────────────────────────────────
 # .NET  (backend/)
 # ─────────────────────────────────────────────

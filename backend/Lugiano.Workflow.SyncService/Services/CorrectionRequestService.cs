@@ -83,9 +83,8 @@ public sealed class CorrectionRequestService
             ? input.OverrideEmail!.Trim()
             : doctor.Email;
         // Email is off for now — kickbacks surface in the doctor's in-portal
-        // Doctor Review instead (Kickback:SendEmail flips it back on). When off
-        // we no longer require an email on file, so a doctor with a blank email
-        // (e.g. the per-office records) can still be sent a correction.
+        // Doctor Review (Kickback:SendEmail flips it on). When off we don't
+        // require an email on file, so a blank-email doctor can still be sent one.
         var sendEmail = _config.GetValue("Kickback:SendEmail", false)
             && !string.IsNullOrWhiteSpace(recipientEmail);
 

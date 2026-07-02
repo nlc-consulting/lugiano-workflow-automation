@@ -4,22 +4,15 @@ using Microsoft.Extensions.Options;
 
 namespace Lugiano.Workflow.SyncService.Services.Fax;
 
-// Thin wrapper around Documo's v1 fax-send REST endpoint. One method:
-// SendAsync(toFax, pdfBytes, filename) -> { faxId, status }.
-//
-// Auth: Documo's documented pattern is HTTP Basic where the API key is the
-// username and the password is empty. (Their JWT-format token works as a
-// Basic credential — Documo treats the whole token as the "username".)
-// If your account has been migrated to Bearer auth, flip BuildAuthHeader().
+// Thin wrapper around Documo's v1 fax-send REST endpoint.
+// Auth: HTTP Basic with the API key as username, empty password (Documo's
+// JWT token works as the whole "username"). If your account was migrated to
+// Bearer auth, flip BuildAuthHeader().
 //
 // Endpoint shape (confirm against the dashboard's API ref before live use):
-//   POST {BaseUrl}/v1/faxes
-//   Content-Type: multipart/form-data
-//   Fields:
-//     faxNumber  — recipient (E.164 or 10-digit US)
-//     attachment — file bytes (the PDF)
-//     coverPage  — "false" (we generate our own first page)
-//     callerId   — optional, overrides Documo account default
+//   POST {BaseUrl}/v1/faxes  multipart/form-data
+//   Fields: faxNumber (E.164 or 10-digit US), attachment (PDF bytes),
+//     coverPage="false" (we generate our own page 1), callerId (optional).
 //   Response (200): { "id": "...", "status": "queued" }
 public sealed class DocumoFaxClient
 {
@@ -87,19 +80,14 @@ public sealed class DocumoFaxClient
     }
 
     // Documo's non-standard auth: literal "Basic " + the raw JWT (NOT
-    // base64-encoded user:password as standard HTTP Basic would require).
-    // Confirmed against the official Documo curl example:
-    //   Authorization: Basic <api_key>
-    // Their Postman docs label this as "Basic" but the value is the raw key.
-    // Anything else returns "Wrong authorization type" with their JWT-based
-    // keys.
+    // base64 user:password). Anything else returns "Wrong authorization type"
+    // with their JWT-based keys.
     private AuthenticationHeaderValue BuildAuthHeader() =>
         new("Basic", _options.ApiKey);
 
-    // Documo requires E.164 with country code (+1 for US). Strip everything
-    // non-numeric, take the last 10 digits, and prepend "1" so the carrier
-    // sees a complete US number. Without the country prefix Documo rejects
-    // with "Invalid country calling code".
+    // Documo requires E.164 with country code (+1 for US): strip non-numeric,
+    // take last 10 digits, prepend "1". Without the prefix Documo rejects with
+    // "Invalid country calling code".
     private static string NormalizeFaxNumber(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return string.Empty;

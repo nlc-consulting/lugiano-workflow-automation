@@ -63,24 +63,20 @@ public sealed class PSChiroWriteService : IPSChiroWriteService
         string plainText,
         CancellationToken ct = default)
     {
-        // Wrap plain text in minimal RTF — proven sufficient for ChiroTouch's
-        // TX_RTF32 renderer (the fuller font/color/style preamble in native
-        // notes is template-generated but not required by the parser).
-        // Cap at 4000 chars for safety (varchar(4096) field).
+        // Minimal RTF is proven sufficient for ChiroTouch's TX_RTF32 renderer;
+        // the fuller native preamble is template-generated, not parser-required.
         var rtfBody = BuildRtf(plainText);
-        // Normalize to midnight. ChiroTouch's UI is date-anchored; real notes
-        // store NoteDate as midnight, so any time component on the input
-        // would diverge from the proven pattern.
+        // Normalize to midnight: ChiroTouch's UI is date-anchored and real notes
+        // store NoteDate as midnight, so any time component diverges.
         var anchoredDate = noteDate.Date;
 
         await using var conn = _writeDb.Create();
         await conn.OpenAsync(ct);
 
-        // Pre-fetch the doctor's stored signature image OUTSIDE the
-        // transaction. If the doctor has never signed before, the writeback
-        // would otherwise silently insert NULL ImageBase64 — the exact
-        // failure mode we hit during validation (ChiroTouch hides the note).
-        // Fail loud with a clear error instead.
+        // Pre-fetch the doctor's stored signature OUTSIDE the transaction. A
+        // doctor who never signed would otherwise insert NULL ImageBase64 —
+        // the validation failure mode where ChiroTouch hides the note. Fail
+        // loud instead.
         var signatureImage = await conn.QuerySingleOrDefaultAsync<string?>(
             """
             SELECT TOP 1 ImageBase64
@@ -157,14 +153,11 @@ public sealed class PSChiroWriteService : IPSChiroWriteService
         string plainText,
         CancellationToken ct = default)
     {
-        // Safety story (verified 6/25/2026 against prod PSChiro):
-        //   1. ChartText.Ptr is the PRIMARY KEY — UPDATE WHERE Ptr=X can only
-        //      ever affect exactly one row (schema-guaranteed).
-        //   2. No SOAPPtr is shared across multiple ChartNotes anywhere in
-        //      prod data — every ChartText row is owned by exactly one note.
-        // Wrapped in a transaction anyway so the 0-row case (row deleted
-        // between SELECT and UPDATE) rolls back cleanly instead of silently
-        // committing the SELECT context.
+        // Safety story (verified 6/25/2026 against prod PSChiro): ChartText.Ptr
+        // is the PRIMARY KEY so UPDATE WHERE Ptr=X hits exactly one row, and no
+        // SOAPPtr is shared across ChartNotes in prod (each ChartText owned by
+        // one note). Transaction anyway so the 0-row case (row deleted between
+        // SELECT and UPDATE) rolls back cleanly.
         var rtfBody = BuildRtf(plainText);
 
         await using var conn = _writeDb.Create();
@@ -172,9 +165,8 @@ public sealed class PSChiroWriteService : IPSChiroWriteService
         await using var tx = await conn.BeginTransactionAsync(ct);
         try
         {
-            // Resolve the ChartText pointer the existing ChartNote uses for
-            // its body. The note row itself is untouched — we just rewrite
-            // the row in dbo.ChartText that it points at.
+            // Resolve the ChartText pointer for the note's body. The note row
+            // is untouched — we only rewrite the dbo.ChartText row it points at.
             var ptr = await conn.QuerySingleOrDefaultAsync<int?>(
                 "SELECT SOAPPtr FROM dbo.ChartNotes WHERE ID = @chartNoteId;",
                 new { chartNoteId }, transaction: tx);
@@ -204,7 +196,7 @@ public sealed class PSChiroWriteService : IPSChiroWriteService
 
     private static string BuildRtf(string plainText)
     {
-        // Minimal RTF envelope — proven to render in ChiroTouch's TX_RTF32 UI.
+        // Minimal RTF envelope proven to render in ChiroTouch's TX_RTF32 UI.
         // Escape backslashes and braces per RTF spec, then wrap.
         var escaped = (plainText ?? string.Empty)
             .Replace("\\", "\\\\")

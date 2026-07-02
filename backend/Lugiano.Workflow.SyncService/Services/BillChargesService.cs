@@ -3,18 +3,16 @@ using Lugiano.Workflow.SyncService.ChiroTouch;
 
 namespace Lugiano.Workflow.SyncService.Services;
 
-// Marks all unbilled service charges on a single visit as "billed" by
-// INSERTing a BilledCharges row per Transaction. Mirrors what ChiroTouch's
-// paper-claim flow does:
-//   - One BilledCharges row per service Transaction (TranType='C', TranSubType='SV')
+// Marks all unbilled service charges on a visit as "billed" by INSERTing a
+// BilledCharges row per Transaction. Mirrors ChiroTouch's paper-claim flow:
+//   - One row per service Transaction (TranType='C', TranSubType='SV')
 //   - ChargeTranID + InsPolID + BilledDate populated
-//   - All other columns (ClaimLineID, PaymentTranID, AppliedAmt, PaidDate)
-//     left NULL — matches 84% of unpaid + 99% of paid BilledCharges rows in
-//     CT's production data (the ClaimLines linkage is only used by the
-//     electronic 837 ANSI flow, not paper HCFA).
+//   - Other columns (ClaimLineID, PaymentTranID, AppliedAmt, PaidDate) left
+//     NULL — matches 84% of unpaid + 99% of paid BilledCharges rows in CT prod
+//     (ClaimLines linkage is only for the electronic 837 flow, not paper HCFA).
 //
-// Used by the post-fax test button. Production flow will eventually be
-// "after fax delivery confirmation -> auto-bill"; for now a human clicks it.
+// Used by the post-fax test button. Eventually fires automatically after fax
+// delivery confirmation; for now a human clicks it.
 public sealed class BillChargesService
 {
     private readonly ISourceDbWriteConnectionFactory _writeDb;
@@ -34,13 +32,11 @@ public sealed class BillChargesService
         await using var conn = _writeDb.Create();
         await conn.OpenAsync(ct);
 
-        // Pick the policy to bill against — the primary policy slot
-        // (Seq = 1), the exact same predicate HCFA's renderer uses for the
-        // Box 11 / Box 1a fields. Critical to stay aligned: if we billed
-        // against a different InsPolID than what's printed on the form, the
-        // tracer + carrier follow-up would point at the wrong policy.
-        // Termination date intentionally NOT filtered — CT considers Seq=1
-        // the active policy regardless, and HCFA prints it as-is.
+        // Bill against the primary policy (Seq=1), the same predicate HCFA's
+        // renderer uses for Box 11 / Box 1a. Must stay aligned — billing a
+        // different InsPolID than the form prints would point the tracer +
+        // carrier follow-up at the wrong policy. Termination date intentionally
+        // NOT filtered: CT treats Seq=1 as active regardless, HCFA prints it as-is.
         var insPolId = await conn.QuerySingleOrDefaultAsync<int?>(
             """
             SELECT TOP 1 ID

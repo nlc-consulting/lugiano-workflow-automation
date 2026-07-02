@@ -17,11 +17,17 @@ public sealed class DoctorNote
     public int? SoapPtr { get; set; }
     public string? RawRtf { get; set; }
     public string? PlainText { get; set; }
+    // When the note was signed off in ChiroTouch (MIN CN SigTimestamp in
+    // dbo.Signatures) — the real "doctor finished" clock, not NoteDate (midnight
+    // only). Matches CT's "Signed: …" line. Null for unsigned / portal correction.
+    public DateTime? SignedAt { get; set; }
     public DateTime CreatedAt { get; set; }
-    // True when this row was authored as a portal correction (doctor responded
-    // inside our portal). Stays true even after the PSChiro writeback sets
-    // ChartNoteId — used to route the next failing scrub to "Human Review"
-    // instead of back to the "Doctor Queue" (which is for fresh chart-sourced
-    // notes that haven't been doctor-corrected yet).
+    // Set when this row's content is refreshed from ChiroTouch after initial
+    // capture (note edited/finalized — SOAPPtr repointed). Null until first
+    // refresh, distinguishing a frozen first-capture row from a reconciled one.
+    public DateTime? UpdatedAt { get; set; }
+    // True when authored as a portal correction. Stays true even after the
+    // PSChiro writeback sets ChartNoteId — routes the next failing scrub to
+    // "Human Review" instead of the "Doctor Queue" (fresh, un-corrected notes).
     public bool IsPortalAuthored { get; set; }
 }

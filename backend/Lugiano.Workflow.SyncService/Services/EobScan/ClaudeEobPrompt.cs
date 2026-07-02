@@ -1,13 +1,12 @@
 namespace Lugiano.Workflow.SyncService.Services.EobScanning;
 
-// System prompt + tool schema for EOB extraction. Locked in via the
-// backend/scratch/EobScanSpike validation runs against the 4/22
-// non-lockbox mail PDF (with DS-produced EOB_Details as ground truth).
-// Bump PromptVersion any time text below changes — used in cost/quality
-// reporting + cache invalidation.
+// System prompt + tool schema for EOB extraction. Locked in via
+// backend/scratch/EobScanSpike runs against the 4/22 non-lockbox mail PDF
+// (DS-produced EOB_Details as ground truth). Bump PromptVersion on any text
+// change below — used in cost/quality reporting + cache invalidation.
 public static class ClaudeEobPrompt
 {
-    public const string PromptVersion = "eob-v1-2026-06-30";
+    public const string PromptVersion = "eob-v3-check-fidelity-2026-07-02";
 
     public const string SystemPrompt = """
 You are extracting structured data from a scanned multi-page batch of insurance EOB
@@ -27,6 +26,26 @@ Extract two arrays:
    - administrator: third-party administrator name if separately identified (else empty).
    - Some EOBs have $0 checks (full denial) — record these too.
 
+   WHAT IS ACTUALLY A CHECK (CRITICAL — read before emitting):
+   A check MUST have ALL of the following on the same page:
+     (a) A printed check number of 5+ characters that looks like a bank check number,
+         voucher number, or "CHECK NO: XXXXX". Not just a dollar amount or a total field.
+     (b) An explicit check date (or "CHECK DATE: mm/dd/yyyy").
+     (c) A dollar amount that is EITHER on an actual check stub (with "PAY TO THE ORDER
+         OF", "PAYEE", or "PAY TO" language, endorsement lines, MICR encoding at the
+         bottom, or an "Authorized Signature" line) OR on an LM lockbox voucher stub with
+         "CHECK NO..:", "CHECK DATE:", "CHECK AMT.:", VOUCHER NO fields.
+
+   DO NOT EMIT AS A CHECK:
+     - A "Total:" or "Total Charges:" field on an EOB line-item table. These are line-item
+       totals, NOT checks. Even if they have a dollar amount.
+     - An EOB header block showing "Total Payment Amount: $X". That's a payment summary,
+       NOT a check stub. The actual check stub with PAY TO / MICR encoding is elsewhere.
+     - Rotated pages where the visible fields don't clearly show a check-stub layout.
+     - Watermarks, DupeProof security notices, or endorsement backer text.
+     - Pages that are mostly blank with just some header text and no check stub layout.
+   If in doubt, do NOT emit a check entry. False checks damage the reconciliation flow.
+
 2) LINE_ITEMS — one entry per service line on the EOB.
    - page_number: the PDF page where the line appears (see PAGE NUMBERING below).
    - claim_number: as printed (preserve dashes, leading zeros, suffixes including
@@ -35,8 +54,14 @@ Extract two arrays:
      "ZAMBRANO, AMADO" output that, if it reads "AMADO ZAMBRANO" output that.
    - bill_number: the carrier's internal bill/claim line id (often blank).
    - service_date: date of service for this line, as printed.
-   - check_number: the check that paid this line, if you can determine it from
-     context (same EOB / same payer). Leave blank if unsure.
+   - check_number: the check that paid this line. This MUST be the check number
+     printed on the check stub of the SAME EOB packet as this line item — normally
+     the check stub that opens this EOB (before the line-item table starts) or the
+     one referenced by the EOB's header. Do NOT use a check number from an adjacent
+     but different EOB even if the check number looks similar (e.g. two USAA checks
+     starting 00448618xx sitting next to each other belong to different patients).
+     If you cannot definitively tie this line to a specific check on THIS EOB, leave
+     blank rather than guess.
    - procedure_code: CPT or HCPCS code as printed, INCLUDING modifiers (e.g.
      "97150-GP" not "97150").
    - billed: amount the provider billed for this line.
@@ -59,6 +84,49 @@ PAGE NUMBERING (CRITICAL):
   the slice-relative index. For example, if the slice starts at page 11 and a
   check appears on the 3rd page of the slice, report page_number = 13.
 
+LM LOCKBOX FORMAT (CRITICAL — read carefully):
+
+Some batches are lockbox mail from third-party claims administrators
+like LODESTAR, Gallagher Bassett, Sedgwick. These have a very
+specific structure:
+
+- Each EOB opens with a check stub showing "CHECK NO..:", "CHECK
+  DATE:", "CHECK AMT.:", plus fields for VOUCHER NO, BILL NO, INSURED,
+  INJURED, CLAIM NO, POLICY NO, INVOICE NO, IRS NUMBER, PATIENT ID.
+
+- Many stubs are DENIAL REMITTANCES stamped
+  "VOID - THIS IS NOT A CHECK" with CHECK NO = literal "00" and
+  CHECK AMT = "$0.00". These ARE legitimate rows to emit — they are
+  the carrier telling the practice "we processed your claim and paid
+  nothing." When CHECK NO reads "00" or is blank, USE THE VOUCHER NO
+  as the effective check identifier (report it in check_number field).
+
+- EOBs span MULTIPLE PAGES ("Page 1 of 5", "Page 2 of 5", etc.). The
+  header repeats on each page. The line-item rows continue across
+  pages. Extract EVERY line item — do not summarize when the same
+  patient's rows continue for many rows or many pages. A single LM
+  EOB routinely contains 20-40 line items per patient.
+
+- Each row's REASON code column often stacks MULTIPLE codes vertically
+  (e.g. "295 / 876 / 5245 / 6532"). Capture ALL of them in
+  reason_codes array with descriptions from the REASON KEY / EXPLANATION
+  OF BENEFITS block usually near the end of the EOB.
+
+- Line-item column headers are typically:
+  FROM - THRU | BILLING CODE | DESCRIPTION | QTY | BILLED AMT |
+  PAYMENT AMT | REASON
+
+  Map these to the required output fields:
+  service_date = FROM (or FROM-THRU midpoint)
+  procedure_code = BILLING CODE
+  billed = BILLED AMT
+  paid = PAYMENT AMT
+  reason_codes = REASON column stack
+
+- Every LM line MUST be emitted even when paid = $0. The $0 rows carry
+  the denial reason codes billers need to triage. DO NOT filter out
+  zero-paid rows in this format.
+
 PAYER vs ADMINISTRATOR:
 - Workers-comp and PIP EOBs are often handled by a Third-Party Administrator
   (TPA) on behalf of the underlying insurer. Common TPAs: Gallagher Bassett,
@@ -70,6 +138,18 @@ PAYER vs ADMINISTRATOR:
   - `administrator` = the TPA processing the claim.
 - If only one entity is named, put it in `payer` and leave `administrator` empty.
 
+ROTATED / SIDEWAYS PAGES (CRITICAL):
+- Some EOB pages are scanned in landscape or rotated 90°/180° (Medlogix, HRAMS,
+  and rotated back-sides of check stubs are common examples).
+- Always mentally rotate the page to portrait / correct reading orientation
+  before extracting.
+- A rotated page STILL belongs to a specific EOB, with a specific patient. The
+  patient name is somewhere on that page or on an adjacent page of the same EOB
+  — find it. If you extract ANY line items from a rotated page, you MUST fill
+  in patient_name — never emit line items with an empty patient_name.
+- If after honest effort the patient name is illegible or absent, DO NOT emit
+  line items from that page — a nameless line item is worse than a missing row.
+
 GENERAL RULES:
 - Include ZERO-PAID lines (denials, exhausted-policy rows). Their reason codes
   drive triage downstream — they are NOT noise.
@@ -78,6 +158,12 @@ GENERAL RULES:
 - Numbers: strip currency symbols and commas; emit as plain decimals.
 - If a value is illegible or unmistakably absent, leave the field empty rather
   than guessing.
+- Column headers vary by carrier. Common line-item fields you'll see across
+  formats: date-of-service (FROM / DOS / Date), CPT/HCPCS code (BILLING CODE /
+  PROC CODE / CPT CODE), billed amount (CHARGES / BILLED AMT / Total Charges),
+  paid amount (PAYMENT AMT / REIM AMOUNT / PAID / Allow.), denial/adjust codes
+  (REASON / EXPLANATION / MESSAGES). Map any recognizable variant to the output
+  schema — do not require the exact LM lockbox column labels.
 
 WHAT NOT TO EMIT AS A LINE ITEM (CRITICAL — these inflate downstream totals):
 - CHECK-TOTAL / SUBTOTAL / PERIOD-SUMMARY rows. These aggregate multiple

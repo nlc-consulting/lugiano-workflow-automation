@@ -20,9 +20,8 @@ public sealed record PatientDemographics(
     // Accident / current-injury date for the active case. Source-of-truth for
     // "when did this case start" when surfacing the case context to reviewers.
     DateTime? CurInjuryDate,
-    // PSChiro AccountNo — the human-facing patient ID the team uses. Shown
-    // bold in the portal header so staff recognize patients by the same
-    // number that's printed on their CT records.
+    // PSChiro AccountNo — the human-facing patient ID the team uses (distinct
+    // from the internal PK). Shown bold in the portal header to match CT records.
     int? AccountNo);
 
 public sealed record InsurancePolicyRow(
@@ -95,6 +94,15 @@ public sealed record OutstandingChargesSummary(
 // (which have no AppointmentID column) by PatientID + same calendar date.
 public sealed record UnbilledVisit(int AppointmentId, DateTime VisitDate);
 
+// A visit where charges were billed but no corresponding ChartNote exists.
+// Used by the missing-note detection surfaced on the workflow dashboard.
+public sealed record MissingNoteVisitRow(
+    int AppointmentId,
+    DateTime VisitDate,
+    int DoctorId,
+    string? DoctorName,
+    int ChargeCount);
+
 public interface IPatientDetailQueries
 {
     bool IsConfigured { get; }
@@ -102,6 +110,16 @@ public interface IPatientDetailQueries
     Task<IReadOnlyList<InsurancePolicyRow>> GetPoliciesAsync(int patientId);
     Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take);
     Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds);
+    // Every billable service charge on a calendar date for one patient,
+    // regardless of Appointment. Scrubber needs the WHOLE day's bill — PSChiro
+    // can split one claim across two Appointments (e.g. E/M + treatment).
+    Task<IReadOnlyList<ChargeRow>> GetChargesForPatientOnDateAsync(int patientId, DateTime date);
+    // Count of billable (patient, date, doctor) tuples that have Service
+    // charges billed but NO matching ChartNote. Keyed by PatientID for batching.
+    Task<IReadOnlyDictionary<int, int>> GetMissingNoteVisitCountsAsync(IEnumerable<int> patientIds);
+    // Detail rows for one patient — the (date, doctor) pairs that have charges
+    // but no note. Drives the patient detail page's drill-in.
+    Task<IReadOnlyList<MissingNoteVisitRow>> GetMissingNoteVisitsForPatientAsync(int patientId);
     // Read-only preview of the charges "Bill now" would mark billed for a visit —
     // the same unbilled-service-charge set BillChargesService.BillVisitAsync writes.
     Task<IReadOnlyList<UnbilledChargeRow>> GetUnbilledChargesForVisitAsync(int patientId, int appointmentId);
@@ -124,12 +142,10 @@ public interface IPatientDetailQueries
     // charge; patients absent from the dictionary have nothing outstanding.
     Task<IReadOnlyDictionary<int, OutstandingChargesSummary>> GetOutstandingChargesAsync(
         IEnumerable<int> patientIds);
-    // Insurance balance per patient — total still owed (unbilled charges +
-    // billed-not-yet-paid AR). Approximated as SUM(charges) - SUM(payments) -
-    // SUM(adjustments) which is mathematically the full account balance;
-    // accurate for Auto/PIP cases where the patient owes nothing (the demo
-    // path). For self-pay or post-EOB residuals this also includes the
-    // patient side — track via task #54 for a proper split.
+    // Insurance balance per patient — total still owed. Computed as
+    // SUM(charges) - SUM(payments) - SUM(adjustments) = full account balance.
+    // Exact for Auto/PIP (patient owes nothing); for self-pay/post-EOB residuals
+    // it also includes the patient side — proper split tracked via task #54.
     Task<IReadOnlyDictionary<int, decimal>> GetInsuranceBalancesAsync(
         IEnumerable<int> patientIds);
     // PSChiro account numbers keyed by Patients.ID. Surfaced on the workflow
@@ -141,17 +157,13 @@ public interface IPatientDetailQueries
     // provider's facility street (see OfficeResolver). Keyed by Patients.ID.
     Task<IReadOnlyDictionary<int, string>> GetOfficesAsync(
         IEnumerable<int> patientIds);
-    // Visits (Appointments) for a single patient where at least one service
-    // charge has not yet been billed. Used by the scrubber to scope the note
-    // bundle and DX list to exactly what's about to bill — no patient-wide
-    // overreach, no human-curated subset. Returns date-only so the caller can
-    // match against DoctorNote.NoteDate.Date for note linkage.
+    // Visits with at least one unbilled service charge. Scopes the scrubber's
+    // note bundle + DX list to exactly what's about to bill. Date-only so the
+    // caller can match against DoctorNote.NoteDate.Date for note linkage.
     Task<IReadOnlyList<UnbilledVisit>> GetUnbilledVisitsAsync(int patientId);
-    // All visits for a patient on or after the given date. Used as a fallback
-    // scrub scope when there are no unbilled visits (charges not entered yet,
-    // or case fully caught up) — we still want to scrub the current case's
-    // documentation against its DX. Pass CurInjuryDate to anchor to the
-    // active case window.
+    // All visits on or after sinceDate — fallback scrub scope when there are no
+    // unbilled visits (charges not entered yet, or case caught up). Pass
+    // CurInjuryDate to anchor to the active case window.
     Task<IReadOnlyList<UnbilledVisit>> GetVisitsSinceAsync(int patientId, DateTime sinceDate);
 }
 
@@ -250,12 +262,9 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
         if (ids.Count == 0) return Array.Empty<VisitDiagnosisRow>();
 
         await using var conn = _sourceDb.Create();
-        // Diagnoses are keyed by AppointmentID, mirroring ChiroTouch's chart-note
-        // DX panel: each visit carries its own ordered set and Seq is the on-screen
-        // priority order. Scoping to the note's matched visit — rather than the
-        // patient-wide union — is what keeps the list identical to ChiroTouch and
-        // free of codes carried only by other visits (e.g. a subsequent-encounter
-        // sprain entered on a different day).
+        // Diagnoses are keyed by AppointmentID; Seq is ChiroTouch's on-screen
+        // priority order. Scoping to the matched visit (not the patient-wide
+        // union) keeps the list identical to ChiroTouch's per-note DX panel.
         const string sql =
             """
             SELECT d.AppointmentID AS AppointmentId,
@@ -266,6 +275,134 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
             ORDER BY d.AppointmentID, d.Seq;
             """;
         return (await conn.QueryAsync<VisitDiagnosisRow>(sql, new { ids })).ToList();
+    }
+
+    public async Task<IReadOnlyDictionary<int, int>> GetMissingNoteVisitCountsAsync(IEnumerable<int> patientIds)
+    {
+        // Batch count of DISTINCT (patient, visit-date, doctor) tuples that have
+        // service charges billed but no matching ChartNote — dashboard decorates
+        // every row in one round-trip.
+        var ids = patientIds.Distinct().ToList();
+        if (ids.Count == 0) return new Dictionary<int, int>();
+
+        await using var conn = _sourceDb.Create();
+        const string sql =
+            """
+            WITH BillableVisits AS (
+                SELECT DISTINCT
+                       a.PatientID,
+                       CAST(a.ScheduleDateTime AS date) AS VisitDate,
+                       a.DoctorID
+                FROM   dbo.Appointments a
+                JOIN   dbo.Transactions t ON t.ApptID = a.ID
+                WHERE  a.PatientID IN @ids
+                  AND  t.TranType    = 'C'
+                  AND  t.TranSubType = 'SV'
+                  AND  t.Code IS NOT NULL AND t.Code <> ''
+            ),
+            NoteCoverage AS (
+                SELECT DISTINCT
+                       cn.PatientID,
+                       CAST(cn.NoteDate AS date) AS NoteDate,
+                       cn.DoctorID
+                FROM   dbo.ChartNotes cn
+                WHERE  cn.PatientID IN @ids
+                  AND  cn.SOAPPtr <> 0
+            )
+            SELECT bv.PatientID AS PatientId, COUNT(*) AS MissingCount
+            FROM   BillableVisits bv
+            LEFT JOIN NoteCoverage nc
+                   ON nc.PatientID = bv.PatientID
+                  AND nc.NoteDate  = bv.VisitDate
+                  AND nc.DoctorID  = bv.DoctorID
+            WHERE  nc.PatientID IS NULL
+            GROUP BY bv.PatientID;
+            """;
+        var rows = await conn.QueryAsync<(int PatientId, int MissingCount)>(sql, new { ids });
+        return rows.ToDictionary(r => r.PatientId, r => r.MissingCount);
+    }
+
+    public async Task<IReadOnlyList<MissingNoteVisitRow>> GetMissingNoteVisitsForPatientAsync(int patientId)
+    {
+        // Per-visit detail: which billed Appointments have no matching ChartNote
+        // by that same doctor on that date. Clickable gap list for the biller.
+        await using var conn = _sourceDb.Create();
+        const string sql =
+            """
+            WITH BillableVisits AS (
+                SELECT a.ID              AS AppointmentId,
+                       a.PatientID,
+                       CAST(a.ScheduleDateTime AS date) AS VisitDate,
+                       a.DoctorID,
+                       COUNT(*)          AS ChargeCount
+                FROM   dbo.Appointments a
+                JOIN   dbo.Transactions t ON t.ApptID = a.ID
+                WHERE  a.PatientID = @patientId
+                  AND  t.TranType    = 'C'
+                  AND  t.TranSubType = 'SV'
+                  AND  t.Code IS NOT NULL AND t.Code <> ''
+                GROUP BY a.ID, a.PatientID, CAST(a.ScheduleDateTime AS date), a.DoctorID
+            ),
+            NoteCoverage AS (
+                SELECT DISTINCT
+                       cn.PatientID,
+                       CAST(cn.NoteDate AS date) AS NoteDate,
+                       cn.DoctorID
+                FROM   dbo.ChartNotes cn
+                WHERE  cn.PatientID = @patientId
+                  AND  cn.SOAPPtr <> 0
+            )
+            SELECT bv.AppointmentId AS AppointmentId,
+                   bv.VisitDate     AS VisitDate,
+                   bv.DoctorID      AS DoctorId,
+                   COALESCE(d.LastName + ISNULL(', ' + d.FirstName, ''), CAST(bv.DoctorID AS varchar(10))) AS DoctorName,
+                   bv.ChargeCount   AS ChargeCount
+            FROM   BillableVisits bv
+            LEFT JOIN NoteCoverage nc
+                   ON nc.PatientID = bv.PatientID
+                  AND nc.NoteDate  = bv.VisitDate
+                  AND nc.DoctorID  = bv.DoctorID
+            LEFT JOIN dbo.Doctors d ON d.ID = bv.DoctorID
+            WHERE  nc.PatientID IS NULL
+            ORDER BY bv.VisitDate DESC, bv.DoctorID;
+            """;
+        return (await conn.QueryAsync<MissingNoteVisitRow>(sql, new { patientId })).ToList();
+    }
+
+    public async Task<IReadOnlyList<ChargeRow>> GetChargesForPatientOnDateAsync(int patientId, DateTime date)
+    {
+        // Widened variant of GetChargesForVisitsAsync: same TranType='C'/
+        // TranSubType='SV' filter and FOR XML PATH ChargeDxs aggregation, but
+        // keyed by patient + calendar date instead of appointment IDs.
+        var dayStart = date.Date;
+        var dayEnd = dayStart.AddDays(1);
+        await using var conn = _sourceDb.Create();
+        const string sql =
+            """
+            SELECT t.ID          AS Id,
+                   t.ApptID      AS AppointmentId,
+                   t.TranDate    AS Date,
+                   t.Code        AS Code,
+                   t.Description AS Description,
+                   t.TranAmt     AS Amount,
+                   cd.M1         AS Modifier1,
+                   cd.M2         AS Modifier2,
+                   STUFF((SELECT ', ' + dx.DxCode
+                          FROM   dbo.ChargeDxs dx
+                          WHERE  dx.ChargeItemID = t.ID
+                          ORDER BY dx.Seq
+                          FOR XML PATH('')), 1, 2, '') AS Diagnoses
+            FROM   dbo.Transactions t
+            LEFT JOIN dbo.ChargeDetails cd ON cd.ChargeTranID = t.ID
+            WHERE  t.PatID       = @patientId
+              AND  t.TranDate   >= @dayStart
+              AND  t.TranDate   <  @dayEnd
+              AND  t.TranType    = 'C'
+              AND  t.TranSubType = 'SV'
+              AND  t.Code IS NOT NULL AND t.Code <> ''
+            ORDER BY t.TranDate DESC, t.ID;
+            """;
+        return (await conn.QueryAsync<ChargeRow>(sql, new { patientId, dayStart, dayEnd })).ToList();
     }
 
     public async Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds)
@@ -445,10 +582,9 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
             return new Dictionary<int, OutstandingChargesSummary>();
 
         await using var conn = _sourceDb.Create();
-        // A charge is outstanding when its underlying service Transaction has
-        // no BilledCharges row. The NOT EXISTS keeps the join cheap on the
-        // indexed BilledCharges.ChargeTranID. Filtering Appointments by
-        // PatientID first bounds the scan to this page of cases.
+        // A charge is outstanding when its service Transaction has no
+        // BilledCharges row. NOT EXISTS rides the indexed
+        // BilledCharges.ChargeTranID; the PatientID filter bounds the scan.
         const string sql =
             """
             SELECT a.PatientID AS PatientId,
@@ -578,9 +714,8 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
     public async Task<IReadOnlyList<UnbilledVisit>> GetVisitsSinceAsync(int patientId, DateTime sinceDate)
     {
         await using var conn = _sourceDb.Create();
-        // All visits (any billing state) for the patient on or after sinceDate.
-        // Reuses the UnbilledVisit shape — only the AppointmentId + VisitDate
-        // matter for downstream scope lookups.
+        // All visits (any billing state) on or after sinceDate. Reuses the
+        // UnbilledVisit shape — only AppointmentId + VisitDate matter downstream.
         const string sql =
             """
             SELECT DISTINCT

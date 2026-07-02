@@ -1,13 +1,10 @@
 namespace Lugiano.Workflow.SyncService.Services.Scrubbing;
 
-// Per-note scrub context. Matches how billing actually works in PSChiro:
-// each provider's chart note for a visit becomes one HCFA claim line, with
-// its own per-Appointment Diagnoses and the visit's Transactions as charges.
-//
-// FocalNote / ItsVisitDiagnoses / ItsVisitCharges describe what's about to
-// be billed (the unit). OtherNotes provides brief chart context so the model
-// can see prior treatment without being asked to evaluate it. ClonedFromPrior
-// flags when the focal note's text is >=95% identical to a recent prior note
+// Per-note scrub context, matching PSChiro billing: each provider's chart note
+// for a visit becomes one HCFA claim line, with its own per-Appointment
+// Diagnoses and the visit's Transactions as charges. FocalNote / ItsVisit*
+// describe the billable unit; OtherNotes is background context (not evaluated).
+// ClonedFromPrior flags focal text >=95% identical to a recent prior note
 // (the practice's "carry forward previous visit" templating habit).
 public sealed record ScrubContext(
     int PatientId,

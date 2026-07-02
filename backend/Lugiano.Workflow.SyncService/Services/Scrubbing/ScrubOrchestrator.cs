@@ -88,10 +88,17 @@ public sealed class ScrubOrchestrator
                 visitDiagnoses = (await _detail.GetDiagnosesForVisitsAsync(new[] { matchedApptId.Value }))
                     .Select(d => string.IsNullOrEmpty(d.Description) ? d.Code : $"{d.Code} {d.Description}")
                     .ToList();
-                visitCharges = (await _detail.GetChargesForVisitsAsync(new[] { matchedApptId.Value }))
-                    .Select(c => new ScrubChargeLine(c.Code ?? string.Empty, c.Description, c.Amount))
-                    .ToList();
             }
+
+            // Charges load by patient + DATE, not the single matched Appt.
+            // PSChiro splits a day's visit into multiple Appointments (E/M +
+            // treatment); the note matches only one via the doctor-priority
+            // heuristic, so loading just its charges misses the siblings'
+            // treatments. (This caused Bolden's Wood 6/23 to see only 99213 and
+            // miss the EMS/Mechanical Traction/CMT/Exercise Group next door.)
+            visitCharges = (await _detail.GetChargesForPatientOnDateAsync(focal.PatientId, focal.NoteDate.Value))
+                .Select(c => new ScrubChargeLine(c.Code ?? string.Empty, c.Description, c.Amount))
+                .ToList();
         }
 
         // Per-note scrub stands alone: no chart-history context, no clone
@@ -148,11 +155,9 @@ public sealed class ScrubOrchestrator
             .FirstOrDefaultAsync(ct);
     }
 
-    // Auto-scrub gate: per-NOTE, not per-case. Each new DoctorNote is its own
-    // evaluation unit (per-note scrubbing) — a prior Pass on an older note no
-    // longer means the new note can be skipped. Returns true unless this
-    // specific note already has a scrub (idempotency safety for sync re-runs),
-    // OR auto-scrubbing is disabled via config (Scrubbing:AutoScrub=false).
+    // Auto-scrub gate: per-NOTE, not per-case — a prior Pass on an older note
+    // doesn't skip a new one. Returns true unless this note already has a scrub
+    // (idempotency for sync re-runs) or auto-scrub is off (Scrubbing:AutoScrub=false).
     public async Task<bool> ShouldAutoScrubAsync(int doctorNoteId, CancellationToken ct = default)
     {
         if (!AutoScrubEnabled)

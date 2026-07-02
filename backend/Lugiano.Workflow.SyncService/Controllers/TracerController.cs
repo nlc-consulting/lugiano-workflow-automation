@@ -46,10 +46,9 @@ public sealed class TracerController : ControllerBase
     public async Task<IActionResult> Preview(
         [FromQuery] int patientId,
         [FromQuery] string? billDates = null,
-        // When true (default), each tracer batch is followed by the HCFA(s)
-        // for the appointment(s) it covers — rendered in fax mode (form
-        // overlay on) so the whole packet faxes as a complete, self-contained
-        // claim follow-up. Set false to send the tracer alone.
+        // When true (default), each tracer batch is followed by its
+        // appointment's HCFA(s) in fax mode (form overlay on) so the packet
+        // faxes as a self-contained claim follow-up. False = tracer alone.
         [FromQuery] bool includeHcfa = true,
         CancellationToken ct = default)
     {
