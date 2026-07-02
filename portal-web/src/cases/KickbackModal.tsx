@@ -50,8 +50,6 @@ type Props = {
 const KickbackModal = ({ open, onClose, patientId, chartNoteId, noteDateLabel, onSent }: Props) => {
   const [loading, setLoading] = useState(false)
   const [doctors, setDoctors] = useState<NoteDoctor[] | null>(null)
-  const [overrideEmail, setOverrideEmail] = useState('')
-  const [saveOverrideAsDefault, setSaveOverrideAsDefault] = useState(false)
   const [missingItems, setMissingItems] = useState<Set<string>>(new Set())
   const [reviewerComments, setReviewerComments] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -61,26 +59,17 @@ const KickbackModal = ({ open, onClose, patientId, chartNoteId, noteDateLabel, o
     if (!open) return
     setError(null)
     setDoctors(null)
-    setOverrideEmail('')
-    setSaveOverrideAsDefault(false)
     setMissingItems(new Set())
     setReviewerComments('')
 
     fetch(`${WORKFLOW_API}/cases/${patientId}/notes/${chartNoteId}/doctors`)
       .then((r) => (r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`)))
-      .then((data: { doctors: NoteDoctor[] }) => {
-        setDoctors(data.doctors ?? [])
-        // Pre-fill override input with the saved email so the reviewer can
-        // tweak it without re-typing. Saving as default stays opt-in.
-        const primary = data.doctors?.[0]
-        if (primary?.email) setOverrideEmail(primary.email)
-      })
+      .then((data: { doctors: NoteDoctor[] }) => setDoctors(data.doctors ?? []))
       .catch((e) => setError(typeof e === 'string' ? e : 'Failed to load doctor info.'))
   }, [open, patientId, chartNoteId])
 
   const primary = doctors?.[0]
-  const effectiveEmail = overrideEmail.trim() || primary?.email || ''
-  const canSend = !loading && !!primary && effectiveEmail.length > 0
+  const canSend = !loading && !!primary
 
   const toggleItem = (item: string) => {
     setMissingItems((prev) => {
@@ -96,8 +85,6 @@ const KickbackModal = ({ open, onClose, patientId, chartNoteId, noteDateLabel, o
     setLoading(true)
     setError(null)
     try {
-      const usingOverride =
-        overrideEmail.trim().length > 0 && overrideEmail.trim() !== (primary.email ?? '')
       const res = await fetch(
         `${WORKFLOW_API}/cases/${patientId}/notes/${chartNoteId}/kickback`,
         {
@@ -105,8 +92,8 @@ const KickbackModal = ({ open, onClose, patientId, chartNoteId, noteDateLabel, o
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             recipientDoctorIds: [primary.id],
-            overrideEmail: usingOverride ? overrideEmail.trim() : null,
-            saveOverrideAsDefault: usingOverride && saveOverrideAsDefault,
+            overrideEmail: null,
+            saveOverrideAsDefault: false,
             missingItems: Array.from(missingItems),
             reviewerComments: reviewerComments.trim() || null,
           }),
@@ -117,10 +104,11 @@ const KickbackModal = ({ open, onClose, patientId, chartNoteId, noteDateLabel, o
         throw new Error(body.error ?? `HTTP ${res.status}`)
       }
       const data = await res.json()
+      const name = `${primary.fullName ?? 'the doctor'}${primary.credentials ? `, ${primary.credentials}` : ''}`
       onSent(
         data.state === 'Escalated'
           ? `Round cap reached (${data.roundNumber}). Case escalated to manual review.`
-          : `Sent to ${data.recipientEmail} (round ${data.roundNumber}).`,
+          : `Sent back to ${name} — now in their Doctor Review (round ${data.roundNumber}).`,
       )
       onClose()
     } catch (e) {
@@ -168,32 +156,9 @@ const KickbackModal = ({ open, onClose, patientId, chartNoteId, noteDateLabel, o
                 {primary.fullName ?? '—'}
                 {primary.credentials ? `, ${primary.credentials}` : ''}
               </Typography>
-              <TextField
-                size="small"
-                fullWidth
-                label="Email"
-                value={overrideEmail}
-                onChange={(e) => setOverrideEmail(e.target.value)}
-                placeholder={primary.email ?? 'No saved email — add one'}
-                sx={{ mt: 1 }}
-              />
-              {(overrideEmail.trim() !== (primary.email ?? '')) && overrideEmail.trim().length > 0 && (
-                <FormControlLabel
-                  sx={{ mt: 0.5 }}
-                  control={
-                    <Checkbox
-                      size="small"
-                      checked={saveOverrideAsDefault}
-                      onChange={(e) => setSaveOverrideAsDefault(e.target.checked)}
-                    />
-                  }
-                  label={
-                    <Typography variant="caption" color="text.secondary">
-                      Save this email as the doctor's default
-                    </Typography>
-                  }
-                />
-              )}
+              <Typography variant="caption" color="text.secondary">
+                Appears in this doctor's Doctor Review — no email sent.
+              </Typography>
             </Box>
           )}
 

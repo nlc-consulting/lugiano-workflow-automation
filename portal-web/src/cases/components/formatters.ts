@@ -23,6 +23,26 @@ export const formatStamp = (s?: string | null): string =>
       }) + ' EDT'
     : '—'
 
+// Note clinical date + time, as stored (clinic-local wall clock). The server
+// emits "yyyy-MM-dd HH:mm:ss"; build a local Date from the parts so the exact
+// wall-clock renders without any timezone conversion. Falls back to date-only
+// for the legacy "yyyy-MM-dd" shape.
+export const formatNoteStamp = (s?: string | null): string => {
+  if (!s) return '—'
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/)
+  if (m) {
+    const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5])
+    return d.toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    })
+  }
+  return formatShortDate(s) ?? '—'
+}
+
 export const formatVisitTime = (iso?: string | null) =>
   iso
     ? new Date(iso).toLocaleTimeString('en-US', {

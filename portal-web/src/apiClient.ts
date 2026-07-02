@@ -24,6 +24,15 @@ export const withAuthHeaders = (headers?: HeadersInit) => {
   return next
 }
 
+// For URLs opened via window.open / direct browser navigation (PDF previews,
+// downloads), the browser can't send the Authorization header — so carry the
+// JWT as an `access_token` query param. The workflow API reads it from there too.
+export const withWorkflowToken = (url: string): string => {
+  const token = getAuthToken()
+  if (!token) return url
+  return url + (url.includes('?') ? '&' : '?') + 'access_token=' + encodeURIComponent(token)
+}
+
 let refreshPromise: Promise<string | null> | null = null
 
 export const refreshAccessToken = async () => {
