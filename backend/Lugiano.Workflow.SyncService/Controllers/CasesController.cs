@@ -47,14 +47,15 @@ public sealed class CasesController : ControllerBase
     // GET /cases — dashboard: the portal's workflow record, newest-first, with per-flow stamps.
     // ra-data-simple-rest: ?range=[start,end] + Content-Range header.
     [HttpGet]
-    public async Task<IActionResult> GetCases([FromQuery] string? range, [FromQuery] string? sort)
+    public async Task<IActionResult> GetCases(
+        [FromQuery] string? range, [FromQuery] string? sort, [FromQuery] string? filter)
     {
         var (skip, take) = ParseRange(range);
         if (take <= 0 || take > 200) take = 25;
         var (sortField, sortDesc) = ParseSort(sort);
+        var officeFilter = ParseOfficeFilter(filter);
 
         await using var db = await _factory.CreateDbContextAsync();
-        var total = await db.WorkflowCases.CountAsync();
 
         // Load ALL cases — several visible columns (LastNoteDate, insurance
         // balance, latest scrub) are computed from joined data, so we can't
@@ -92,7 +93,7 @@ public sealed class CasesController : ControllerBase
         // bounded by page size × ~50 notes per case, cheap.
         var notesForCases = await db.DoctorNotes.AsNoTracking()
             .Where(n => caseIds.Contains(n.WorkflowCaseId))
-            .Select(n => new { CaseId = n.WorkflowCaseId, NoteId = n.Id, n.NoteDate })
+            .Select(n => new { CaseId = n.WorkflowCaseId, NoteId = n.Id, n.NoteDate, n.ChartNoteId })
             .ToListAsync();
         var latestNotePerCase = notesForCases
             .GroupBy(n => n.CaseId)
@@ -101,8 +102,20 @@ public sealed class CasesController : ControllerBase
                 g =>
                 {
                     var latest = g.OrderByDescending(n => n.NoteDate).ThenByDescending(n => n.NoteId).First();
-                    return new { latest.NoteId, latest.NoteDate };
+                    return new { latest.NoteId, latest.NoteDate, latest.ChartNoteId };
                 });
+
+        // ChiroTouch stores NoteDate as a date only (always midnight), so the
+        // real "when it came in" clock is the signature timestamp. Pull the
+        // signed time for each case's latest note so LastNoteDate can show it.
+        var latestChartNoteIds = latestNotePerCase.Values
+            .Where(v => v.ChartNoteId.HasValue)
+            .Select(v => v.ChartNoteId!.Value)
+            .Distinct()
+            .ToList();
+        var signedTimes = _detail.IsConfigured && latestChartNoteIds.Count > 0
+            ? await _detail.GetSignedTimesAsync(latestChartNoteIds)
+            : new Dictionary<int, DateTime>();
 
         // Dashboard rollup: verdict of the LATEST NOTE's most recent scrub
         // (not "latest scrub run across notes"). Matches the user rule
@@ -136,6 +149,10 @@ public sealed class CasesController : ControllerBase
         var accountByPatient = _detail.IsConfigured
             ? await _detail.GetAccountNumbersAsync(patientIds)
             : new Dictionary<int, int>();
+        // Office per patient (primary provider's facility → canonical label).
+        var officeByPatient = _detail.IsConfigured
+            ? await _detail.GetOfficesAsync(patientIds)
+            : new Dictionary<int, string>();
 
         var rows = cases.Select(c =>
         {
@@ -145,6 +162,16 @@ public sealed class CasesController : ControllerBase
             var scrub = scrubByCase.GetValueOrDefault(c.Id);
             outstandingByPatient.TryGetValue(c.PatientId, out var outstanding);
             var insuranceBalance = insuranceByPatient.GetValueOrDefault(c.PatientId);
+
+            // "Last note" timestamp: prefer the latest note's signed time (the
+            // real clock), fall back to its clinical NoteDate (carries a time
+            // only for portal-injected notes), then to the workflow stamp.
+            var latestNote = latestNotePerCase.GetValueOrDefault(c.Id);
+            DateTime? lastNoteStamp = null;
+            if (latestNote?.ChartNoteId is int cnId && signedTimes.TryGetValue(cnId, out var sigAt))
+                lastNoteStamp = sigAt;
+            lastNoteStamp ??= latestNote?.NoteDate;
+            lastNoteStamp ??= c.DoctorNotesReceivedAt;
 
             return new CaseDto(
                 c.PatientId, c.PatientId, c.FirstName, c.LastName,
@@ -160,19 +187,27 @@ public sealed class CasesController : ControllerBase
                 // chip reads it as "what insurance owes us total".
                 OutstandingChargesTotal: insuranceBalance,
                 OldestOutstandingChargeDate: outstanding?.OldestChargeDate,
-                // Clinical calendar date — emit as date-only "yyyy-MM-dd" so
-                // the client doesn't interpret midnight-UTC as the previous
-                // evening in EDT. The dashboard formatter (formatShortDate)
-                // detects this shape and renders without timezone shift.
-                LastNoteDate: (latestNotePerCase.GetValueOrDefault(c.Id)?.NoteDate
-                              ?? c.DoctorNotesReceivedAt)?.ToString("yyyy-MM-dd"),
+                // Clinical date + time of the latest note, as stored (clinic-
+                // local wall clock). Sortable "yyyy-MM-dd HH:mm:ss" so the string
+                // sort in ApplySort stays chronological; the dashboard formatter
+                // (formatNoteStamp) renders it from the parts so the wall clock
+                // can't shift across timezones.
+                LastNoteDate: lastNoteStamp?.ToString("yyyy-MM-dd HH:mm:ss"),
                 // Latest note's DoctorNote.Id — exposed so the dashboard's
                 // "Scrub now" button can fire POST /notes/{id}/scrub for the
                 // most recent note when auto-scrub is paused for cost control.
                 LatestDoctorNoteId: latestNotePerCase.GetValueOrDefault(c.Id)?.NoteId,
-                AccountNo: accountByPatient.TryGetValue(c.PatientId, out var acct) ? acct : (int?)null);
+                AccountNo: accountByPatient.TryGetValue(c.PatientId, out var acct) ? acct : (int?)null,
+                Office: officeByPatient.GetValueOrDefault(c.PatientId, OfficeResolver.Main));
         }).ToList();
 
+        // Office filter (react-admin ?filter={"office":"Center City"}). Applied
+        // before total/sort/paginate so the Content-Range total reflects the
+        // filtered set and pagination stays correct.
+        if (!string.IsNullOrWhiteSpace(officeFilter))
+            rows = rows.Where(r => string.Equals(r.Office, officeFilter, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        var total = rows.Count;
         rows = ApplySort(rows, sortField, sortDesc);
 
         // Paginate after sort — react-admin's range is over the sorted result.
@@ -180,6 +215,24 @@ public sealed class CasesController : ControllerBase
         var last = total == 0 ? 0 : Math.Min(skip + page.Count - 1, total - 1);
         Response.Headers["Content-Range"] = $"cases {skip}-{last}/{total}";
         return Ok(page);
+    }
+
+    // react-admin sends list filters as ?filter={"office":"...","q":"..."}.
+    // We only honor the office filter today; unknown keys are ignored.
+    private static string? ParseOfficeFilter(string? filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(filter);
+            if (doc.RootElement.TryGetProperty("office", out var o) && o.ValueKind == JsonValueKind.String)
+            {
+                var v = o.GetString();
+                return string.IsNullOrWhiteSpace(v) ? null : v;
+            }
+        }
+        catch { /* malformed filter — ignore */ }
+        return null;
     }
 
     // react-admin ra-data-simple-rest sends sort as ?sort=["field","ORDER"].
@@ -217,6 +270,7 @@ public sealed class CasesController : ControllerBase
             "lastnotedate"            => Order(rows, r => r.LastNoteDate, desc),
             "latestscrubat"           => Order(rows, r => r.LatestScrubAt, desc),
             "outstandingchargestotal" => Order(rows, r => (decimal?)r.OutstandingChargesTotal, desc),
+            "office"                  => Order(rows, r => r.Office, desc),
             "currentstate"            => Order(rows, r => r.CurrentState, desc),
             "addedat"                 => Order(rows, r => (DateTime?)r.AddedAt, desc),
             "lastupdatedat"           => Order(rows, r => (DateTime?)r.LastUpdatedAt, desc),
@@ -615,26 +669,38 @@ public sealed class CasesController : ControllerBase
             text: req.Text.Trim(),
             noteDate: attributedNoteDate);
 
-        // PSChiro writeback (Phase 2). When the write account is configured
-        // and we have a doctor + date to anchor to, push the correction into
-        // ChartNotes so it appears in ChiroTouch alongside the original. Best
-        // effort — failures here log but don't fail the response (our portal
-        // DB still has the correction, and re-scrub still fires).
+        // PSChiro writeback. Preferred path when we have the original
+        // ChartNoteId: UPDATE the existing note's body in place — preserves
+        // CT metadata (note id, signature, appointment linkage) and avoids
+        // duplicate notes for the same DOS. Fallback to INSERT a new
+        // ChartNote only when the original has no ChartNoteId (rare:
+        // chain-of-corrections where the prior correction was itself
+        // portal-authored).
         int? writebackChartNoteId = null;
-        if (_pschiroWrite.IsConfigured
-            && attributedDoctorId.HasValue
-            && attributedNoteDate.HasValue)
+        if (_pschiroWrite.IsConfigured)
         {
             try
             {
-                var writeResult = await _pschiroWrite.WriteCorrectionChartNoteAsync(
-                    patientId: id,
-                    doctorId: attributedDoctorId.Value,
-                    noteDate: attributedNoteDate.Value,
-                    plainText: req.Text.Trim(),
-                    ct: ct);
-                await _cases.LinkPortalNoteToChartNoteAsync(doctorNoteId, writeResult.ChartNoteId);
-                writebackChartNoteId = writeResult.ChartNoteId;
+                if (original?.ChartNoteId is int existingChartNoteId)
+                {
+                    await _pschiroWrite.UpdateChartNoteBodyAsync(
+                        chartNoteId: existingChartNoteId,
+                        plainText: req.Text.Trim(),
+                        ct: ct);
+                    await _cases.LinkPortalNoteToChartNoteAsync(doctorNoteId, existingChartNoteId);
+                    writebackChartNoteId = existingChartNoteId;
+                }
+                else if (attributedDoctorId.HasValue && attributedNoteDate.HasValue)
+                {
+                    var writeResult = await _pschiroWrite.WriteCorrectionChartNoteAsync(
+                        patientId: id,
+                        doctorId: attributedDoctorId.Value,
+                        noteDate: attributedNoteDate.Value,
+                        plainText: req.Text.Trim(),
+                        ct: ct);
+                    await _cases.LinkPortalNoteToChartNoteAsync(doctorNoteId, writeResult.ChartNoteId);
+                    writebackChartNoteId = writeResult.ChartNoteId;
+                }
             }
             catch (Exception ex)
             {
@@ -832,4 +898,7 @@ public record CaseDto(
     // PSChiro AccountNo — the human-facing ID the team uses to identify
     // patients. Surfaced on the dashboard alongside the internal Patients.ID
     // so staff aren't forced to memorize new keys.
-    int? AccountNo);
+    int? AccountNo,
+    // Canonical office label (patient's primary provider's facility). Drives the
+    // dashboard Office column + the office filter. See OfficeResolver.
+    string? Office);

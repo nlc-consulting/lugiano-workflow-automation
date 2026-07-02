@@ -87,3 +87,14 @@ public static class SourceSystems
     public const string Ai = "AI";
     public const string ManualReview = "ManualReview";
 }
+
+// Lifecycle of an EOB scan upload. Queued = uploaded, not yet processing;
+// Running = chunks fanning out to Claude; Completed = all chunks merged +
+// persisted; Failed = terminal error, ErrorMessage explains.
+public static class EobScanStatuses
+{
+    public const string Queued = "queued";
+    public const string Running = "running";
+    public const string Completed = "completed";
+    public const string Failed = "failed";
+}

@@ -24,6 +24,23 @@ async function main() {
   });
 
   console.log(`Seeded user: ${email} / ${password}`);
+
+  // Demo doctor login — Dr. Roger Saias (Center City). DOCTOR role → sees the
+  // Doctor View (kicked-back notes) only. Same demo password.
+  const drEmail = 'drsaias@papainandrehab.com';
+  await prisma.user.upsert({
+    where: { email: drEmail },
+    update: { passwordHash, role: UserRole.DOCTOR, office: 'Center City', isActive: true },
+    create: {
+      email: drEmail,
+      passwordHash,
+      fullName: 'Roger Saias, DC',
+      role: UserRole.DOCTOR,
+      office: 'Center City',
+    },
+  });
+
+  console.log(`Seeded user: ${drEmail} / ${password}`);
 }
 
 main()

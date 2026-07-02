@@ -20,6 +20,7 @@ import {
 } from '@mui/material'
 import PictureAsPdf from '@mui/icons-material/PictureAsPdf'
 import Send from '@mui/icons-material/Send'
+import { withWorkflowToken } from '../../apiClient'
 
 const WORKFLOW_API = import.meta.env.VITE_WORKFLOW_API_URL || '/workflow-api'
 
@@ -108,7 +109,9 @@ const TracerCard = () => {
     if (patientId == null || selected.size === 0) return
     const dates = Array.from(selected).join(',')
     window.open(
-      `${WORKFLOW_API}/tracer/preview?patientId=${patientId}&billDates=${dates}&includeHcfa=${includeHcfa}`,
+      withWorkflowToken(
+        `${WORKFLOW_API}/tracer/preview?patientId=${patientId}&billDates=${dates}&includeHcfa=${includeHcfa}`,
+      ),
       '_blank',
     )
   }

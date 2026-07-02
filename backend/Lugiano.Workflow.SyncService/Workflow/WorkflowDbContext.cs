@@ -17,6 +17,9 @@ public sealed class WorkflowDbContext : DbContext
     public DbSet<Doctor> Doctors => Set<Doctor>();
     public DbSet<CorrectionRequest> CorrectionRequests => Set<CorrectionRequest>();
     public DbSet<ScrubResult> ScrubResults => Set<ScrubResult>();
+    public DbSet<EobScan> EobScans => Set<EobScan>();
+    public DbSet<EobScanCheck> EobScanChecks => Set<EobScanCheck>();
+    public DbSet<EobScanLineItem> EobScanLineItems => Set<EobScanLineItem>();
 
     // SQL Server datetime2 doesn't store DateTimeKind. We always write UTC, so stamp
     // reads as UTC — this makes the JSON include the 'Z' so clients convert correctly.
@@ -133,6 +136,61 @@ public sealed class WorkflowDbContext : DbContext
             e.Property(x => x.RanAt).HasDefaultValueSql("SYSUTCDATETIME()");
             // "Latest result for this note" is the hot lookup — index it.
             e.HasIndex(x => new { x.DoctorNoteId, x.RanAt });
+        });
+
+        b.Entity<EobScan>(e =>
+        {
+            e.ToTable("EobScan");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.SourceFilename).HasMaxLength(400).IsRequired();
+            e.Property(x => x.StoredPdfPath).HasMaxLength(1000);
+            e.Property(x => x.Status).HasMaxLength(20).IsRequired();
+            e.Property(x => x.ModelUsed).HasMaxLength(80);
+            e.Property(x => x.EstimatedCostUsd).HasColumnType("decimal(10,4)");
+            e.Property(x => x.UploadedAt).HasDefaultValueSql("SYSUTCDATETIME()");
+            // Dashboard query is "most recent scans" — index supports that.
+            e.HasIndex(x => x.UploadedAt);
+            e.HasMany(x => x.Checks)
+                .WithOne()
+                .HasForeignKey(x => x.EobScanId)
+                .OnDelete(DeleteBehavior.Cascade);
+            e.HasMany(x => x.LineItems)
+                .WithOne()
+                .HasForeignKey(x => x.EobScanId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<EobScanCheck>(e =>
+        {
+            e.ToTable("EobScanCheck");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.CheckNumber).HasMaxLength(60).IsRequired();
+            e.Property(x => x.CheckDate).HasMaxLength(40);
+            e.Property(x => x.Amount).HasColumnType("decimal(12,2)");
+            e.Property(x => x.Payer).HasMaxLength(200);
+            e.Property(x => x.Administrator).HasMaxLength(200);
+            // Most lookups are "all checks for this scan" — composite index
+            // covers that AND the dedupe-by-(scan, page, check#) pattern in
+            // the orchestrator's overlap handling.
+            e.HasIndex(x => new { x.EobScanId, x.PageNumber });
+        });
+
+        b.Entity<EobScanLineItem>(e =>
+        {
+            e.ToTable("EobScanLineItem");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.ClaimNumber).HasMaxLength(80);
+            e.Property(x => x.PatientNameRaw).HasMaxLength(400);
+            e.Property(x => x.BillNumber).HasMaxLength(80);
+            e.Property(x => x.ServiceDate).HasMaxLength(40);
+            e.Property(x => x.CheckNumber).HasMaxLength(60);
+            e.Property(x => x.ProcedureCode).HasMaxLength(20).IsRequired();
+            e.Property(x => x.BilledAmount).HasColumnType("decimal(12,2)");
+            e.Property(x => x.AllowedAmount).HasColumnType("decimal(12,2)");
+            e.Property(x => x.PaidAmount).HasColumnType("decimal(12,2)");
+            e.Property(x => x.WriteOffAmount).HasColumnType("decimal(12,2)");
+            e.Property(x => x.ReasonCodesJson).IsRequired();
+            e.HasIndex(x => new { x.EobScanId, x.PageNumber });
         });
     }
 }

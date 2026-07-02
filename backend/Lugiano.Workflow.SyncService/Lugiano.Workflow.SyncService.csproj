@@ -18,6 +18,10 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.*" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.*" />
+    <!-- PDF page-splitting for the EOB scanner — keeps each Claude Vision
+         call under the 32MB/100-page Anthropic Messages API caps. -->
+    <PackageReference Include="PdfSharpCore" Version="1.3.*" />
   </ItemGroup>
 
   <ItemGroup>

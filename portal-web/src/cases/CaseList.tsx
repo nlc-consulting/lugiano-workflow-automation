@@ -4,6 +4,7 @@ import {
   Datagrid,
   FunctionField,
   List,
+  SelectInput,
   TextField,
   useNotify,
   useRefresh,
@@ -17,7 +18,7 @@ const WORKFLOW_API = import.meta.env.VITE_WORKFLOW_API_URL || '/workflow-api'
 // Re-enable by restoring the import and the <VerifyPipButton /> column below.
 // import VerifyPipButton from './VerifyPipButton'
 import EstDateTimeField from './EstDateTimeField'
-import { formatShortDate } from './components/formatters'
+import { formatNoteStamp } from './components/formatters'
 
 type CaseRecord = RaRecord & {
   firstName?: string
@@ -30,7 +31,36 @@ type CaseRecord = RaRecord & {
   lastNoteDate?: string | null
   latestDoctorNoteId?: number | null
   accountNo?: number | null
+  office?: string | null
 }
+
+// Canonical office labels — must match OfficeResolver on the backend.
+const OFFICES = [
+  'Center City',
+  'PA Pain & Rehab (Main)',
+  'North Broad',
+  'Woodland',
+  'South Philadelphia',
+  'Lebanon Avenue',
+  'Other / Unassigned',
+]
+
+// Office filter shown above the table. alwaysOn so it's visible without opening
+// a filter menu; combined with filterDefaultValues it boots up scoped to
+// Center City. Clearing it (empty choice) shows all offices.
+const caseFilters = [
+  <SelectInput
+    key="office"
+    source="office"
+    label="Office"
+    alwaysOn
+    // Relabel the empty option so clearing the filter reads "All offices"
+    // (and shows every office) instead of a blank/floaty state. An empty
+    // value omits the filter on the wire, so the backend returns all rows.
+    emptyText="All offices"
+    choices={OFFICES.map((o) => ({ id: o, name: o }))}
+  />,
+]
 
 const SCRUB_LABELS: Record<string, string> = {
   pass: 'Pass',
@@ -125,12 +155,14 @@ const ScrubStatusChip = ({ row }: { row: CaseRecord }) => {
         direction="row"
         spacing={1}
         alignItems="center"
+        // nowrap so the chip + button never wrap into adjacent columns.
+        sx={{ flexWrap: 'nowrap' }}
         // Belt-and-braces: any click inside this cell that isn't the chip
         // text itself should stop bubbling so the row-click never fires
         // when the user is reaching for the button.
         onClick={(e) => e.stopPropagation()}
       >
-        <Chip size="small" variant="outlined" label="Scrub pending" />
+        <Chip size="small" variant="outlined" label="Scrub pending" sx={{ flexShrink: 0 }} />
         {noteId != null && (
           <Tooltip title="Run a one-off scrub on the latest note" arrow>
             <span>
@@ -147,7 +179,9 @@ const ScrubStatusChip = ({ row }: { row: CaseRecord }) => {
                     <PlayArrow fontSize="small" />
                   )
                 }
-                sx={{ minWidth: 0, py: 0.25, px: 1, textTransform: 'none' }}
+                // whiteSpace:nowrap keeps "Scrub now" on one line; flexShrink:0
+                // stops the button collapsing and breaking the label.
+                sx={{ whiteSpace: 'nowrap', flexShrink: 0, py: 0.25, px: 1, textTransform: 'none' }}
               >
                 {running ? 'Scrubbing…' : 'Scrub now'}
               </Button>
@@ -196,7 +230,12 @@ const AutoScrubBanner = () => {
 }
 
 const CaseList = () => (
-  <List title="Patients in Workflow" sort={{ field: 'lastUpdatedAt', order: 'DESC' }}>
+  <List
+    title="Patients in Workflow"
+    sort={{ field: 'lastUpdatedAt', order: 'DESC' }}
+    filters={caseFilters}
+    filterDefaultValues={{ office: 'Center City' }}
+  >
     <AutoScrubBanner />
     <Datagrid rowClick="show" bulkActionButtons={false}>
       {/* AccountNo is what the team identifies patients by — bold to anchor
@@ -222,13 +261,14 @@ const CaseList = () => (
         label="Patient"
         render={(r: CaseRecord) => `${r.firstName ?? ''} ${r.lastName ?? ''}`.trim()}
       />
+      <TextField source="office" label="Office" />
       <BooleanField source="insuranceProvided" label="Insurance" />
       {/* Clinical date — render without time component so a midnight-UTC date
           doesn't shift to "previous day 8 PM EDT". */}
       <FunctionField
         label="Last note"
         sortBy="lastNoteDate"
-        render={(r: CaseRecord) => formatShortDate(r.lastNoteDate) ?? '—'}
+        render={(r: CaseRecord) => formatNoteStamp(r.lastNoteDate)}
       />
       {/* PIP verified column parked alongside the action button — re-enable together. */}
       {/* <BooleanField source="pipVerified" label="PIP Verified" /> */}

@@ -13,6 +13,7 @@ import {
 } from '@mui/material'
 import ArrowDropDown from '@mui/icons-material/ArrowDropDown'
 import Description from '@mui/icons-material/Description'
+import { withWorkflowToken } from '../../apiClient'
 
 const WORKFLOW_API = import.meta.env.VITE_WORKFLOW_API_URL || '/workflow-api'
 
@@ -36,7 +37,7 @@ const HcfaSplitButton = ({ patientId, visitId }: Props) => {
 
   const open_ = (mode: 'mail' | 'fax') => {
     const url = `${WORKFLOW_API}/hcfa/preview?patientId=${patientId}&appointmentId=${visitId}&mode=${mode}`
-    window.open(url, '_blank')
+    window.open(withWorkflowToken(url), '_blank')
   }
 
   const sendFax = async () => {

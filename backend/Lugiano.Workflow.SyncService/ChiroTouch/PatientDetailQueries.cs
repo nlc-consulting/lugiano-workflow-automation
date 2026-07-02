@@ -67,6 +67,9 @@ public sealed record ChartNoteRow(
 
 public sealed record VisitDiagnosisRow(int AppointmentId, string Code, string? Description);
 
+// One unbilled service charge on a visit — what "Bill now" would mark billed.
+public sealed record UnbilledChargeRow(int Id, string? Code, string? Description, decimal Amount);
+
 public sealed record PatientDiagnosisRow(string Code, string? Description);
 
 public sealed record PatientListRow(
@@ -99,9 +102,15 @@ public interface IPatientDetailQueries
     Task<IReadOnlyList<InsurancePolicyRow>> GetPoliciesAsync(int patientId);
     Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take);
     Task<IReadOnlyList<ChargeRow>> GetChargesForVisitsAsync(IEnumerable<int> appointmentIds);
+    // Read-only preview of the charges "Bill now" would mark billed for a visit —
+    // the same unbilled-service-charge set BillChargesService.BillVisitAsync writes.
+    Task<IReadOnlyList<UnbilledChargeRow>> GetUnbilledChargesForVisitAsync(int patientId, int appointmentId);
     // Per-visit diagnosis sets, keyed by appointment, Seq-ordered. Used by the
     // portal detail view to mirror ChiroTouch's per-note DX panel.
     Task<IReadOnlyList<VisitDiagnosisRow>> GetDiagnosesForVisitsAsync(IEnumerable<int> appointmentIds);
+    // Signed timestamp (CN signature) per chart note id — the real "when it came
+    // in" clock, since ChartNotes.NoteDate is a date only (always midnight).
+    Task<IReadOnlyDictionary<int, DateTime>> GetSignedTimesAsync(IEnumerable<int> chartNoteIds);
     // Patient-wide diagnosis union (every distinct DX code carried on any of
     // the patient's appointments). Used by the AI scrubber so it evaluates the
     // body of notes against the full diagnosis list, not just one visit's.
@@ -127,6 +136,10 @@ public interface IPatientDetailQueries
     // dashboard because the team identifies patients by AccountNo, not the
     // internal PK. Patients with NULL AccountNo are simply absent from the map.
     Task<IReadOnlyDictionary<int, int>> GetAccountNumbersAsync(
+        IEnumerable<int> patientIds);
+    // Canonical office label per patient, resolved from the patient's primary
+    // provider's facility street (see OfficeResolver). Keyed by Patients.ID.
+    Task<IReadOnlyDictionary<int, string>> GetOfficesAsync(
         IEnumerable<int> patientIds);
     // Visits (Appointments) for a single patient where at least one service
     // charge has not yet been billed. Used by the scrubber to scope the note
@@ -210,6 +223,27 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
         return (await conn.QueryAsync<PatientDiagnosisRow>(sql, new { patientId })).ToList();
     }
 
+    public async Task<IReadOnlyDictionary<int, DateTime>> GetSignedTimesAsync(IEnumerable<int> chartNoteIds)
+    {
+        var ids = chartNoteIds.Distinct().ToList();
+        if (ids.Count == 0) return new Dictionary<int, DateTime>();
+
+        await using var conn = _sourceDb.Create();
+        // Earliest CN signature per note = the signed-off time. SigTimestamp
+        // carries the real clock; NoteDate is midnight-only.
+        var rows = await conn.QueryAsync<(int ChartNoteId, DateTime SignedAt)>(
+            """
+            SELECT s.SigTypeID AS ChartNoteId, MIN(s.SigTimestamp) AS SignedAt
+            FROM   dbo.Signatures s
+            WHERE  s.SigType = 'CN'
+              AND  s.SigTypeID IN @ids
+              AND  s.SigTimestamp IS NOT NULL
+            GROUP BY s.SigTypeID;
+            """,
+            new { ids });
+        return rows.ToDictionary(r => r.ChartNoteId, r => r.SignedAt);
+    }
+
     public async Task<IReadOnlyList<VisitDiagnosisRow>> GetDiagnosesForVisitsAsync(IEnumerable<int> appointmentIds)
     {
         var ids = appointmentIds.Distinct().ToList();
@@ -269,6 +303,30 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
             ORDER BY t.TranDate DESC, t.ID;
             """;
         return (await conn.QueryAsync<ChargeRow>(sql, new { ids })).ToList();
+    }
+
+    public async Task<IReadOnlyList<UnbilledChargeRow>> GetUnbilledChargesForVisitAsync(int patientId, int appointmentId)
+    {
+        await using var conn = _sourceDb.Create();
+        // Mirrors BillChargesService's unbilled filter exactly (LEFT JOIN
+        // BilledCharges + IS NULL) so the confirm dialog shows precisely what the
+        // POST will bill. Read-only — no writes.
+        const string sql =
+            """
+            SELECT t.ID          AS Id,
+                   t.Code        AS Code,
+                   t.Description  AS Description,
+                   t.TranAmt      AS Amount
+            FROM   dbo.Transactions t
+            LEFT JOIN dbo.BilledCharges bc ON bc.ChargeTranID = t.ID
+            WHERE  t.PatID       = @patientId
+              AND  t.ApptID      = @appointmentId
+              AND  t.TranType    = 'C'
+              AND  t.TranSubType = 'SV'
+              AND  bc.ID IS NULL
+            ORDER BY t.ID;
+            """;
+        return (await conn.QueryAsync<UnbilledChargeRow>(sql, new { patientId, appointmentId })).ToList();
     }
 
     public async Task<IReadOnlyList<ChartNoteRow>> GetRecentNotesAsync(int patientId, int take)
@@ -470,6 +528,26 @@ public sealed class PatientDetailQueries : IPatientDetailQueries
             new { ids });
         return rows.Where(r => r.AccountNo.HasValue)
                    .ToDictionary(r => r.PatientId, r => r.AccountNo!.Value);
+    }
+
+    public async Task<IReadOnlyDictionary<int, string>> GetOfficesAsync(IEnumerable<int> patientIds)
+    {
+        var ids = patientIds.Distinct().ToList();
+        if (ids.Count == 0) return new Dictionary<int, string>();
+
+        await using var conn = _sourceDb.Create();
+        // Office is encoded in the provider's credential suffix (e.g. "…, DC, CC"
+        // = Center City), so we attribute via the patient's primary provider name
+        // (Patients.DoctorID → Doctors.FullName) and decode with OfficeResolver.
+        var rows = await conn.QueryAsync<(int PatientId, string? ProviderName)>(
+            """
+            SELECT p.ID AS PatientId, d.FullName AS ProviderName
+            FROM   dbo.Patients p
+            LEFT JOIN dbo.Doctors d ON d.ID = p.DoctorID
+            WHERE  p.ID IN @ids;
+            """,
+            new { ids });
+        return rows.ToDictionary(r => r.PatientId, r => OfficeResolver.Resolve(r.ProviderName));
     }
 
     public async Task<IReadOnlyList<UnbilledVisit>> GetUnbilledVisitsAsync(int patientId)

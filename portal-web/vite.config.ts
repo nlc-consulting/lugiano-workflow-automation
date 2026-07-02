@@ -7,7 +7,10 @@ export default defineConfig({
   server: {
     // Vite rejects requests whose Host header isn't in this list — add any
     // ngrok / tunnel domains you share the dev server through.
-    allowedHosts: ['localhost', 'ngrok.nlc.consulting'],
+    allowedHosts: ['localhost', 'ngrok.nlc.consulting', '.nlcportals.com'],
+    // HMR websocket must reach the browser through the Cloudflare tunnel
+    // (public HTTPS :443), not the raw vite port on localhost.
+    hmr: { host: 'lugiano.nlcportals.com', protocol: 'wss', clientPort: 443 },
     proxy: {
       // Portal API (NestJS): auth, users, portal data.
       '/api': 'http://localhost:3000',

@@ -43,6 +43,42 @@ public sealed class EobController : ControllerBase
         }
     }
 
+    // GET /eob/lookup-patient?accountNo=N — manual override path. Operator
+    // types the ChiroTouch AccountNo they recognize for a patient; we return
+    // the matching patient (with name + DOB) for confirmation, or 404 if no
+    // patient has that AccountNo. Frontend shows the result in a confirm
+    // dialog before invoking resolve-line on the chosen patient.
+    [HttpGet("lookup-patient")]
+    public async Task<IActionResult> LookupPatient(
+        [FromQuery] int accountNo,
+        CancellationToken ct)
+    {
+        if (accountNo <= 0)
+            return BadRequest(new { error = "accountNo is required and must be > 0." });
+        var hit = await _preview.LookupPatientByAccountNoAsync(accountNo, ct);
+        if (hit is null)
+            return NotFound(new { error = $"No PSChiro patient found with AccountNo = {accountNo}." });
+        return Ok(hit);
+    }
+
+    // POST /eob/resolve-line — re-runs the per-line match against a chosen
+    // patient. Used by the portal's fuzzy-suggestion chip on unmatched lines:
+    // operator clicks a suggested patient, frontend POSTs the original line
+    // + patientId, we return the new bucket (matched / ambiguous / still
+    // unmatched). No PSChiro writes — pure read.
+    [HttpPost("resolve-line")]
+    public async Task<IActionResult> ResolveLine(
+        [FromBody] ResolveLineRequest req,
+        CancellationToken ct)
+    {
+        if (req?.Line is null || req.PatientId <= 0)
+            return BadRequest(new { error = "Body must include `line` and `patientId`." });
+        var result = await _preview.ResolveLineWithPatientAsync(req.Line, req.PatientId, ct);
+        return Ok(result);
+    }
+
+    public sealed record ResolveLineRequest(EobLine Line, int PatientId);
+
     // POST /eob/apply — same xlsx upload as /preview, but actually writes to
     // PSChiro. Re-runs the match server-side (no client-tampered list of
     // proposed updates), applies all unambiguous matches in one transaction,

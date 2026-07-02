@@ -4,6 +4,7 @@ using Lugiano.Workflow.SyncService.Services.Email;
 using Lugiano.Workflow.SyncService.Workflow;
 using Lugiano.Workflow.SyncService.Workflow.Models;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace Lugiano.Workflow.SyncService.Services;
@@ -19,17 +20,20 @@ public sealed class CorrectionRequestService
     private readonly IDbContextFactory<WorkflowDbContext> _dbFactory;
     private readonly IEmailSender _email;
     private readonly IPatientDetailQueries _detail;
+    private readonly IConfiguration _config;
     private readonly ILogger<CorrectionRequestService> _logger;
 
     public CorrectionRequestService(
         IDbContextFactory<WorkflowDbContext> dbFactory,
         IEmailSender email,
         IPatientDetailQueries detail,
+        IConfiguration config,
         ILogger<CorrectionRequestService> logger)
     {
         _dbFactory = dbFactory;
         _email = email;
         _detail = detail;
+        _config = config;
         _logger = logger;
     }
 
@@ -78,9 +82,12 @@ public sealed class CorrectionRequestService
         var recipientEmail = !string.IsNullOrWhiteSpace(input.OverrideEmail)
             ? input.OverrideEmail!.Trim()
             : doctor.Email;
-        if (string.IsNullOrWhiteSpace(recipientEmail))
-            throw new InvalidOperationException(
-                $"Doctor {doctor.FullName} has no saved email and no override was provided.");
+        // Email is off for now — kickbacks surface in the doctor's in-portal
+        // Doctor Review instead (Kickback:SendEmail flips it back on). When off
+        // we no longer require an email on file, so a doctor with a blank email
+        // (e.g. the per-office records) can still be sent a correction.
+        var sendEmail = _config.GetValue("Kickback:SendEmail", false)
+            && !string.IsNullOrWhiteSpace(recipientEmail);
 
         // Loop-cap: don't keep emailing the doctor forever.
         if (round > LoopCap)
@@ -113,17 +120,6 @@ public sealed class CorrectionRequestService
             doctor.UpdatedAt = DateTime.UtcNow;
         }
 
-        // Pull patient context for the email body. Demographics live in ChiroTouch.
-        var demo = await _detail.GetDemographicsAsync(wc.PatientId);
-        var patientCtx = new CorrectionEmailComposer.PatientContext(
-            FirstName: demo?.FirstName ?? wc.FirstName,
-            LastName: demo?.LastName ?? wc.LastName,
-            DateOfBirth: null,                  // not in our current demographics read
-            DateOfService: note.NoteDate);
-        var message = CorrectionEmailComposer.Compose(
-            recipientEmail!, doctor.FullName, patientCtx,
-            input.MissingItems, input.ReviewerComments, round);
-
         var now = DateTime.UtcNow;
         var request = new CorrectionRequest
         {
@@ -141,26 +137,39 @@ public sealed class CorrectionRequestService
         db.CorrectionRequests.Add(request);
         await db.SaveChangesAsync(ct);
 
-        var sent = await _email.SendAsync(message, ct);
-        if (sent)
+        if (sendEmail)
         {
-            request.State = CorrectionStates.Sent;
-            request.SentAt = DateTime.UtcNow;
+            // Demographics live in ChiroTouch — only needed for the email body.
+            var demo = await _detail.GetDemographicsAsync(wc.PatientId);
+            var patientCtx = new CorrectionEmailComposer.PatientContext(
+                FirstName: demo?.FirstName ?? wc.FirstName,
+                LastName: demo?.LastName ?? wc.LastName,
+                DateOfBirth: null,                  // not in our current demographics read
+                DateOfService: note.NoteDate);
+            var message = CorrectionEmailComposer.Compose(
+                recipientEmail!, doctor.FullName, patientCtx,
+                input.MissingItems, input.ReviewerComments, round);
+
+            var sent = await _email.SendAsync(message, ct);
+            if (sent)
+            {
+                request.State = CorrectionStates.Sent;
+                request.SentAt = DateTime.UtcNow;
+            }
         }
 
-        // Always transition the case so the reviewer sees the awaiting-correction
-        // status even if the email send is queued/failed (Pending stays until
-        // retry; Sent transitions on success).
+        // Always transition the case so the doctor sees the awaiting-correction
+        // status. With email off the request stays Pending until the doctor
+        // corrects it in-portal (the note is already in their Doctor Review).
         wc.CurrentState = WorkflowStates.AwaitingDoctorCorrection;
         wc.UpdatedAt = DateTime.UtcNow;
         await db.SaveChangesAsync(ct);
 
         _logger.LogInformation(
-            "Kickback {Action} for DoctorNote {NoteId}, round {Round}, recipient {Recipient}.",
-            sent ? "sent" : "queued (send failed)",
-            note.Id, round, recipientEmail);
+            "Kickback recorded for DoctorNote {NoteId}, round {Round}, recipient {Recipient} (email {EmailState}).",
+            note.Id, round, doctor.FullName, sendEmail ? "sent" : "skipped");
 
-        return new KickbackResult(request.Id, request.State, round, recipientEmail, wc.CurrentState);
+        return new KickbackResult(request.Id, request.State, round, sendEmail ? recipientEmail : null, wc.CurrentState);
     }
 
     // Auto-resolve: marks any open CorrectionRequests for the patient as Resolved.

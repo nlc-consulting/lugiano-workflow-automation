@@ -29,6 +29,16 @@ public interface IPSChiroWriteService
         DateTime noteDate,
         string plainText,
         CancellationToken ct = default);
+
+    // Updates the body of an existing ChartNote in place — used when the
+    // doctor's correction is a fix of an existing note (not a new note).
+    // Preserves the original ChartNotes row entirely (ID, date, doctor,
+    // signature, appointment linkage); only ChartText.TextBody is rewritten.
+    // Returns the existing ChartTextPtr so the caller can audit-log it.
+    Task<int> UpdateChartNoteBodyAsync(
+        int chartNoteId,
+        string plainText,
+        CancellationToken ct = default);
 }
 
 public sealed record WriteCorrectionResult(int ChartNoteId, int ChartTextPtr);
@@ -134,6 +144,56 @@ public sealed class PSChiroWriteService : IPSChiroWriteService
                 patientId, doctorId, noteDate, noteId, newPtr);
 
             return new WriteCorrectionResult(ChartNoteId: noteId, ChartTextPtr: newPtr);
+        }
+        catch
+        {
+            await tx.RollbackAsync(ct);
+            throw;
+        }
+    }
+
+    public async Task<int> UpdateChartNoteBodyAsync(
+        int chartNoteId,
+        string plainText,
+        CancellationToken ct = default)
+    {
+        // Safety story (verified 6/25/2026 against prod PSChiro):
+        //   1. ChartText.Ptr is the PRIMARY KEY — UPDATE WHERE Ptr=X can only
+        //      ever affect exactly one row (schema-guaranteed).
+        //   2. No SOAPPtr is shared across multiple ChartNotes anywhere in
+        //      prod data — every ChartText row is owned by exactly one note.
+        // Wrapped in a transaction anyway so the 0-row case (row deleted
+        // between SELECT and UPDATE) rolls back cleanly instead of silently
+        // committing the SELECT context.
+        var rtfBody = BuildRtf(plainText);
+
+        await using var conn = _writeDb.Create();
+        await conn.OpenAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        try
+        {
+            // Resolve the ChartText pointer the existing ChartNote uses for
+            // its body. The note row itself is untouched — we just rewrite
+            // the row in dbo.ChartText that it points at.
+            var ptr = await conn.QuerySingleOrDefaultAsync<int?>(
+                "SELECT SOAPPtr FROM dbo.ChartNotes WHERE ID = @chartNoteId;",
+                new { chartNoteId }, transaction: tx);
+            if (ptr is null || ptr.Value == 0)
+                throw new InvalidOperationException(
+                    $"ChartNote {chartNoteId} not found or has no SOAPPtr — cannot update body.");
+
+            var rows = await conn.ExecuteAsync(
+                "UPDATE dbo.ChartText SET TextBody = @body WHERE Ptr = @ptr;",
+                new { body = rtfBody, ptr = ptr.Value }, transaction: tx);
+            if (rows != 1)
+                throw new InvalidOperationException(
+                    $"ChartText UPDATE for Ptr {ptr.Value} affected {rows} rows — expected 1.");
+
+            await tx.CommitAsync(ct);
+            _logger.LogInformation(
+                "PSChiro chart-note body updated in place: ChartNotes.ID {ChartNoteId} -> ChartText.Ptr {Ptr}.",
+                chartNoteId, ptr.Value);
+            return ptr.Value;
         }
         catch
         {

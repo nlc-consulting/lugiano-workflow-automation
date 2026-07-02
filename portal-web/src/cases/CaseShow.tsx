@@ -44,8 +44,8 @@ const CaseShowContent = () => (
     <PatientHeader />
     <AwaitingCorrectionBanner />
     <StatusRow />
-    <CaseScrubCard />
     <InsurancePoliciesCard />
+    <CaseScrubCard />
     <NotesAndDiagnosesCard />
     <TracerCard />
     <ChargesCard />

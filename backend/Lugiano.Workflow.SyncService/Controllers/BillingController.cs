@@ -1,3 +1,4 @@
+using Lugiano.Workflow.SyncService.ChiroTouch;
 using Lugiano.Workflow.SyncService.Services;
 using Microsoft.AspNetCore.Mvc;
 
@@ -13,8 +14,39 @@ namespace Lugiano.Workflow.SyncService.Controllers;
 public sealed class BillingController : ControllerBase
 {
     private readonly BillChargesService _billing;
+    private readonly IPatientDetailQueries _detail;
 
-    public BillingController(BillChargesService billing) => _billing = billing;
+    public BillingController(BillChargesService billing, IPatientDetailQueries detail)
+    {
+        _billing = billing;
+        _detail = detail;
+    }
+
+    // GET /billing/visit/preview?patientId=X&appointmentId=Y
+    // Read-only: returns the unbilled service charges + total that POST /billing/visit
+    // would mark billed. Powers the "Bill now" confirmation dialog.
+    [HttpGet("visit/preview")]
+    public async Task<IActionResult> PreviewVisit([FromQuery] int patientId, [FromQuery] int appointmentId)
+    {
+        if (patientId <= 0 || appointmentId <= 0)
+            return BadRequest(new { error = "patientId and appointmentId are required." });
+        if (!_detail.IsConfigured)
+            return Ok(new { count = 0, total = 0m, charges = Array.Empty<object>() });
+
+        var charges = await _detail.GetUnbilledChargesForVisitAsync(patientId, appointmentId);
+        return Ok(new
+        {
+            count = charges.Count,
+            total = charges.Sum(c => c.Amount),
+            charges = charges.Select(c => new
+            {
+                id = c.Id,
+                code = c.Code,
+                description = c.Description,
+                amount = c.Amount,
+            }),
+        });
+    }
 
     // POST /billing/visit?patientId=X&appointmentId=Y
     // INSERTs BilledCharges rows for every unbilled service Transaction on
